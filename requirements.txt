@@ -1,0 +1,6 @@
+boto3==1.34.42
+duckdb==0.10.1
+pydantic==2.6.1
+ulid-py==1.1.0
+pandas==2.2.0
+pyarrow==15.0.0

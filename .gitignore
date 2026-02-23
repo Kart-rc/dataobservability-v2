@@ -5,3 +5,4 @@ dist/
 
 .agent/
 .agents/
+__pycache__/
