@@ -49,13 +49,12 @@ This LLD is organized by component, following the data flow from storage event t
 
 1. **C-01: Hook Dispatcher** — Receives and normalizes storage events
 2. **C-02: Validation Orchestrator (Step Functions)** — Routes and controls execution
-3. **C-03: Validation Engines (DuckDB & Spark)** — Runs the 6-gate pipeline
+3. **C-03: Validation Engines (DuckDB & Spark)** — Runs the validation pipeline using external data services
 4. **C-04: Certified View Manager** — Manages staging → certified promotion
 5. **C-05: Freshness Monitor** — Detects missing expected data
 6. **C-06: OpenLineage Collector** — Ingests lifecycle and lineage events
 7. **C-07: Evidence Emitter** — Publishes evidence to the Evidence Bus
 8. **C-08: Dataset Registry** — Stores dataset.yaml configurations
-9. **C-09: Baselines Store** — Historical metrics for anomaly detection
 
 ### 1.5 Requirements Traceability
 
@@ -509,26 +508,34 @@ The Validation Engines form the execution layer that runs the configured 6-gate 
 ### 4.2 Engine Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│     Step Function Execution (RunValidation Task)        │
-└────────┬───────────────────────────────────────┬────────┘
-         │ (Fargate Task)                        │ (EMR JobRun)
-         ▼                                       ▼
-┌──────────────────────┐               ┌──────────────────────┐
-│  DuckDB Worker Pod   │               │ Spark Serverless App │
-│                      │               │                      │
-│ ┌──────────────────┐ │               │ ┌──────────────────┐ │
-│ │ Gate Orchestrator│ │               │ │ Gate Orchestrator│ │
-│ │ (Python/DuckDB)  │ │               │ │ (Scala/PySpark)  │ │
-│ └────────┬─────────┘ │               │ └────────┬─────────┘ │
-└──────────┼───────────┘               └──────────┼───────────┘
-           │                                      │
-           ▼                                      ▼
-    ┌────────────┐                         ┌────────────┐
-    │  Evidence  │                         │ Step Func  │
-    │  Emitter   │                         │ Task Token │
-    └────────────┘                         │ Callback   │
-                                           └────────────┘
+┌────────────────────────────────────────────────────────────┐
+│         Step Function Execution (RunValidation Task)       │
+└───────────┬─────────────────────────────────────┬──────────┘
+            │ (Fargate Task)                      │ (EMR Job)
+            ▼                                     ▼
+┌────────────────────────┐               ┌────────────────────────┐
+│   DuckDB Worker Pod    │               │  Spark Serverless App  │
+│                        │               │                        │
+│ ┌────────────────────┐ │               │ ┌────────────────────┐ │
+│ │ Gate Orchestrator  │ │               │ │ Gate Orchestrator  │ │
+│ │  (Python/DuckDB)   │ │               │ │  (Scala/PySpark)   │ │
+│ └─┬──────┬───────┬───┘ │               │ └─┬──────┬───────┬───┘ │
+│   │      │       │     │               │   │      │       │     │
+│   ▼      ▼       ▼     │               │   ▼      ▼       ▼     │
+│ ┌────┐ ┌────┐ ┌─────┐  │               │ ┌────┐ ┌────┐ ┌─────┐  │
+│ │ G3 │ │ G4 │ │ G6  │  │               │ │ G3 │ │ G4 │ │ G6  │  │
+│ └─┬──┘ └─┬──┘ └─┬───┘  │               │ └─┬──┘ └─┬──┘ └─┬───┘  │
+└───┼──────┼──────┼──────┘               └───┼──────┼──────┼──────┘
+    │      │      │                          │      │      │       
+    ▼      ▼      ▼                          ▼      ▼      ▼       
+┌────────────────────────────────────────────────────────────┐
+│                  Standard Data Services                    │
+│                                                            │
+│ ┌───────────────┐  ┌───────────────┐ ┌───────────────────┐ │
+│ │ Data Contract │  │  Data Quality │ │ Data Volume/Anom. │ │
+│ │    Service    │  │     Service   │ │      Service      │ │
+│ └───────────────┘  └───────────────┘ └───────────────────┘ │
+└────────────────────────────────────────────────────────────┘
 ```
 
 ### 4.3 Data Reader — DuckDB Engine
@@ -788,18 +795,14 @@ class IdentityGate(Gate):
         )
 ```
 
-#### G3: Schema Gate — Drift Detection
+#### G3: Schema Gate — Data Contract Client
 
 ```python
-import hashlib
-
 class SchemaGate(Gate):
-    """G3: Compare committed schema against registered contract. Detect drift and PII."""
+    """G3: Validate schema using the external Data Contract Service."""
 
-    PII_PATTERNS = ["ssn", "social_security", "credit_card", "password", "secret", "token"]
-
-    def __init__(self, schema_registry):
-        self.registry = schema_registry
+    def __init__(self, data_contract_client):
+        self.contract_client = data_contract_client
 
     def evaluate(self, request, data_reader, context) -> GateOutcome:
         start = time.monotonic()
@@ -816,51 +819,42 @@ class SchemaGate(Gate):
         actual_schema = data_reader.get_schema(relation)
         context.data_relation = relation  # Cache for downstream gates
 
-        expected_schema, schema_source = self.registry.get_registered_schema(
-            dataset_urn=request.dataset_urn,
-            storage_type=request.storage_type,
-            table_path=request.table_path,
-            commit_version=request.commit_version,
-            policy_bundle=context.policy_bundle,
-        )
-
-        if expected_schema is None:
-            return GateOutcome(
-                gate_name="G3_SCHEMA",
-                result=GateResult.WARN,
-                detail="Schema source unavailable; drift detection skipped",
-                duration_ms=self._elapsed(start),
-                metadata={"schema_source": "UNAVAILABLE"},
-                failure_summary=None,
+        # Call Data Contract Service
+        try:
+            response = self.contract_client.evaluate_schema(
+                dataset_urn=request.dataset_urn,
+                actual_schema=actual_schema
             )
-
-        context.schema_source = schema_source   # annotated in evidence
-        drift = self._compute_drift(expected_schema, actual_schema)
-        pii_violations = self._detect_pii(actual_schema, context.policy_bundle)
-
-        actual_fingerprint = self._fingerprint(actual_schema)
-        expected_fingerprint = self._fingerprint(expected_schema)
+            
+            result_status = response.get("status", "FAIL") # PASS, WARN, FAIL
+            drift_details = response.get("drift", {})
+            pii_violations = response.get("pii_violations", [])
+            
+        except ExternalServiceException as e:
+            logger.warning(f"Data Contract Service unavailable for {request.dataset_urn}: {e}")
+            return GateOutcome(
+                gate_name="SCHEMA",
+                result="WARN",
+                duration_ms=int((time.monotonic() - start) * 1000),
+                failure_summary="DATA_CONTRACT_SERVICE_UNAVAILABLE"
+            )
 
         # Decision logic
         if pii_violations:
             result = GateResult.FAIL
             detail = f"PII field detected in output: {', '.join(pii_violations)}"
             failure_summary = f"PII_VIOLATION:{','.join(pii_violations)}"
-        elif drift.removed_columns:
+        elif result_status == "FAIL":
             result = GateResult.FAIL
-            detail = f"Breaking drift: {len(drift.removed_columns)} column(s) removed"
-            failure_summary = f"SCHEMA_BREAKING:{','.join(c['name'] for c in drift.removed_columns)}"
-        elif drift.type_changes:
-            result = GateResult.FAIL
-            detail = f"Breaking drift: {len(drift.type_changes)} column type change(s)"
-            failure_summary = f"TYPE_CHANGE:{','.join(c['name'] for c in drift.type_changes)}"
-        elif drift.added_columns:
+            detail = f"Schema drift detected"
+            failure_summary = f"SCHEMA_DRIFT:{drift_details}"
+        elif result_status == "WARN":
             result = GateResult.WARN
-            detail = f"Additive drift: {len(drift.added_columns)} column(s) added (non-breaking)"
+            detail = f"Additive schema drift"
             failure_summary = None
         else:
             result = GateResult.PASS
-            detail = "Schema matches contract"
+            detail = "Schema matches expected contract"
             failure_summary = None
 
         return GateOutcome(
@@ -869,49 +863,11 @@ class SchemaGate(Gate):
             detail=detail,
             duration_ms=self._elapsed(start),
             metadata={
-                "actual_fingerprint": actual_fingerprint,
-                "expected_fingerprint": expected_fingerprint,
-                "drift": asdict(drift) if drift.has_changes else None,
+                "drift": drift_details,
                 "pii_violations": pii_violations,
             },
             failure_summary=failure_summary,
         )
-
-    def _fingerprint(self, schema: list[dict]) -> str:
-        """Deterministic schema fingerprint for drift detection."""
-        canonical = json.dumps(
-            sorted(schema, key=lambda f: f["name"]),
-            sort_keys=True,
-        )
-        return f"sha256:{hashlib.sha256(canonical.encode()).hexdigest()[:16]}"
-
-    def _compute_drift(self, expected, actual) -> SchemaDrift:
-        expected_names = {f["name"] for f in expected}
-        actual_names = {f["name"] for f in actual}
-        expected_map = {f["name"]: f for f in expected}
-        actual_map = {f["name"]: f for f in actual}
-
-        return SchemaDrift(
-            added_columns=[actual_map[n] for n in actual_names - expected_names],
-            removed_columns=[expected_map[n] for n in expected_names - actual_names],
-            type_changes=[
-                {"name": n, "expected": expected_map[n]["type"], "actual": actual_map[n]["type"]}
-                for n in expected_names & actual_names
-                if expected_map[n]["type"] != actual_map[n]["type"]
-            ],
-        )
-
-    def _detect_pii(self, schema, policy_bundle) -> list[str]:
-        """Detect PII columns in Gold output that shouldn't be there."""
-        if policy_bundle.pii_action != "FAIL":
-            return []
-        allowed_pii = set(policy_bundle.pii_columns or [])
-        violations = []
-        for field in schema:
-            name_lower = field["name"].lower()
-            if any(p in name_lower for p in self.PII_PATTERNS) and field["name"] not in allowed_pii:
-                violations.append(field["name"])
-        return violations
 ```
 
 #### §4.4.2a — `SchemaRegistryClient`
@@ -1018,136 +974,70 @@ class SchemaRegistryClient:
         return (parts[0], parts[1]) if len(parts) >= 2 else (None, None)
 ```
 
-#### G4: Contract Gate — Data Quality Rules
+#### G4: Contract Gate — Data Quality Client
 
 ```python
 class ContractGate(Gate):
-    """G4: Evaluate data quality rules from the policy bundle."""
+    """G4: Evaluate data quality rules via external Data Quality Service."""
 
-    MAX_SAMPLE_ROWS = 5_000_000  # Full scan up to 5M rows
+    def __init__(self, data_quality_client):
+        self.dq_client = data_quality_client
 
     def evaluate(self, request, data_reader, context) -> GateOutcome:
         start = time.monotonic()
         relation = context.data_relation  # From G3 (cached)
-        rules = context.policy_bundle.contracts
         row_count = data_reader.get_row_count(relation)
 
-        results = []
-        for rule in rules:
-            rule_result = self._evaluate_rule(rule, relation, data_reader, row_count)
-            results.append(rule_result)
+        try:
+            # 1. Submit validation job to Data Quality Service
+            job_id = self.dq_client.submit_validation(
+                dataset_urn=request.dataset_urn,
+                data_location=request.table_path,
+                partition_values=request.partition_values
+            )
+            
+            # 2. Wait for completion (with timeout)
+            # In a real Spark/Step Functions environment, this could be async.
+            # For micro-batches, we poll.
+            response = self.dq_client.wait_for_completion(job_id, timeout_sec=20)
+            
+            status = response.get("status", "FAIL") # PASS, FAIL
+            rule_results = response.get("rule_results", [])
+            
+        except ExternalServiceException as e:
+            logger.warning(f"Data Quality Service unavailable: {e}")
+            return GateOutcome(
+                gate_name="G4_CONTRACT",
+                result=GateResult.WARN,
+                detail="Data Quality Service unavailable",
+                duration_ms=self._elapsed(start),
+                failure_summary="DATA_QUALITY_SERVICE_UNAVAILABLE"
+            )
 
-        passed = sum(1 for r in results if r["result"] == "PASS")
-        failed = sum(1 for r in results if r["result"] == "FAIL")
+        passed = sum(1 for r in rule_results if r["status"] == "PASS")
+        failed = sum(1 for r in rule_results if r["status"] == "FAIL")
 
-        if failed > 0:
-            failed_rules = [r for r in results if r["result"] == "FAIL"]
-            failure_summaries = [
-                f"{r['rule']}({r.get('column', 'N/A')})" for r in failed_rules
-            ]
+        if status == "FAIL" or failed > 0:
+            failed_rules = [r for r in rule_results if r["status"] == "FAIL"]
+            failure_summaries = [f"{r['rule_name']}({r.get('column', 'N/A')})" for r in failed_rules]
+            
             return GateOutcome(
                 gate_name="G4_CONTRACT",
                 result=GateResult.FAIL,
-                detail=f"{failed}/{len(rules)} rules failed: {', '.join(failure_summaries)}",
+                detail=f"{failed}/{len(rule_results)} rules failed: {', '.join(failure_summaries)}",
                 duration_ms=self._elapsed(start),
-                metadata={"rules": results, "records_scanned": row_count, "scan_mode": "FULL"},
+                metadata={"rules": rule_results, "records_scanned": row_count},
                 failure_summary=f"CONTRACT_FAIL:{';'.join(failure_summaries)}",
             )
 
         return GateOutcome(
             gate_name="G4_CONTRACT",
             result=GateResult.PASS,
-            detail=f"{passed}/{len(rules)} rules passed",
+            detail=f"{passed}/{len(rule_results)} rules passed",
             duration_ms=self._elapsed(start),
-            metadata={"rules": results, "records_scanned": row_count, "scan_mode": "FULL"},
+            metadata={"rules": rule_results, "records_scanned": row_count},
             failure_summary=None,
         )
-
-    def _evaluate_rule(self, rule: dict, relation, data_reader, row_count) -> dict:
-        """Evaluate a single contract rule."""
-        rule_type = rule["rule"]
-        column = rule.get("column") or rule.get("columns", [None])[0]
-        threshold = rule.get("threshold", 1.0)
-
-        if rule_type == "NOT_NULL":
-            columns = rule.get("columns", [rule.get("column")])
-            # Build query for multiple columns
-            conditions = " AND ".join(f'"{c}" IS NOT NULL' for c in columns)
-            compliant = data_reader.conn.sql(
-                f"SELECT count(*) FROM ({relation.sql_query()}) t WHERE {conditions}"
-            ).fetchone()[0]
-            compliance = compliant / row_count if row_count > 0 else 0
-            return {
-                "rule": "NOT_NULL", "column": ",".join(columns),
-                "compliance": round(compliance, 6), "threshold": threshold,
-                "result": "PASS" if compliance >= threshold else "FAIL",
-            }
-
-        elif rule_type == "UNIQUE":
-            distinct_count = data_reader.conn.sql(
-                f'SELECT count(DISTINCT "{column}") FROM ({relation.sql_query()}) t'
-            ).fetchone()[0]
-            compliance = distinct_count / row_count if row_count > 0 else 0
-            duplicate_count = row_count - distinct_count
-            result_dict = {
-                "rule": "UNIQUE", "column": column,
-                "compliance": round(compliance, 6), "threshold": threshold,
-                "result": "PASS" if compliance >= threshold else "FAIL",
-            }
-            if compliance < threshold:
-                result_dict["failure_detail"] = {
-                    "duplicate_count": duplicate_count,
-                    "likely_cause": "Double-write from retry without idempotency key"
-                    if duplicate_count > row_count * 0.1 else "Partial key overlap",
-                }
-            return result_dict
-
-        elif rule_type == "RANGE":
-            min_val, max_val = rule["min"], rule["max"]
-            compliant = data_reader.conn.sql(
-                f'SELECT count(*) FROM ({relation.sql_query()}) t '
-                f'WHERE "{column}" >= {min_val} AND "{column}" <= {max_val}'
-            ).fetchone()[0]
-            compliance = compliant / row_count if row_count > 0 else 0
-            return {
-                "rule": "RANGE", "column": column,
-                "compliance": round(compliance, 6), "threshold": threshold,
-                "result": "PASS" if compliance >= threshold else "FAIL",
-            }
-
-        elif rule_type == "REGEX":
-            pattern = rule["pattern"]
-            compliant = data_reader.conn.sql(
-                f"SELECT count(*) FROM ({relation.sql_query()}) t "
-                f"WHERE regexp_matches(\"{column}\", '{pattern}')"
-            ).fetchone()[0]
-            compliance = compliant / row_count if row_count > 0 else 0
-            return {
-                "rule": "REGEX", "column": column,
-                "compliance": round(compliance, 6), "threshold": threshold,
-                "result": "PASS" if compliance >= threshold else "FAIL",
-            }
-
-        elif rule_type == "REFERENTIAL":
-            # Referential integrity requires reading the reference table
-            ref_table = rule["reference_table"]
-            ref_column = rule["reference_column"]
-            ref_path = data_reader.resolve_certified_path(ref_table)
-            # Join-based check
-            compliant = data_reader.conn.sql(f"""
-                SELECT count(*) FROM ({relation.sql_query()}) t
-                INNER JOIN read_parquet('{ref_path}/**/*.parquet', hive_partitioning=true) r
-                ON t."{column}" = r."{ref_column}"
-            """).fetchone()[0]
-            compliance = compliant / row_count if row_count > 0 else 0
-            return {
-                "rule": "REFERENTIAL", "column": column,
-                "compliance": round(compliance, 6), "threshold": threshold,
-                "result": "PASS" if compliance >= threshold else "FAIL",
-                "reference_table": ref_table,
-            }
-
-        return {"rule": rule_type, "result": "SKIP", "detail": "Unknown rule type"}
 ```
 
 #### G5: Freshness Gate
@@ -1216,35 +1106,72 @@ class VolumeGate(Gate):
         # Get actual row count
         actual_rows = request.num_records
         if actual_rows is None:
+#### G6: Volume Gate — Data Volume Service
+
+**Purpose**: Detects massive spikes or drops in data volume that indicate pipeline malfunction, even if all other data quality rules pass.
+
+**Implementation**: G6 acts as a client to the standard **Data Volume/Anomaly Service**. Instead of maintaining and computing baselines locally, G6 submits the current row count to the external API, which compares it against historical baselines and returns an anomaly assessment.
+
+```python
+class VolumeGate(Gate):
+    """G6: Check data volume against external Data Volume Service baselines."""
+
+    def __init__(self, data_volume_client):
+        self.volume_client = data_volume_client
+
+    def evaluate(self, request, data_reader, context) -> GateOutcome:
+        start = time.monotonic()
+        slo = context.policy_bundle.slo.get("volume") if context.policy_bundle else None
+
+        if not slo:
+            return GateOutcome(
+                gate_name="G6_VOLUME", result=GateResult.SKIP,
+                detail="No volume SLO defined", duration_ms=self._elapsed(start),
+                metadata={}, failure_summary=None,
+            )
+
+        # Get actual row count
+        actual_rows = request.num_records
+        if actual_rows is None:
             # Parquet: must count from data
             actual_rows = data_reader.get_row_count(context.data_relation)
 
-        # Get baseline
-        baseline = self.baselines_store.get_baseline(
-            context.dataset.dataset_urn,
-            metric="row_count",
-            source=slo.get("baseline_source", "7_day_rolling_avg"),
-        )
-
-        if baseline is None:
+        try:
+            # Call Data Volume Service
+            response = self.volume_client.evaluate_volume(
+                dataset_urn=request.dataset_urn,
+                actual_rows=actual_rows,
+                baseline_source=slo.get("baseline_source", "7_day_rolling_avg"),
+                allowed_deviation_pct=slo.get("allowed_deviation_pct", 15.0)
+            )
+            
+            status = response.get("status", "FAIL") # PASS, WARN, FAIL
+            baseline_rows = response.get("baseline_rows", 0)
+            deviation_pct = response.get("deviation_pct", 0.0)
+            
+        except ExternalServiceException as e:
+            logger.warning(f"Data Volume Service unavailable: {e}")
             return GateOutcome(
-                gate_name="G6_VOLUME", result=GateResult.WARN,
-                detail="No baseline available; volume check skipped",
+                gate_name="G6_VOLUME",
+                result=GateResult.WARN,
+                detail="Data Volume Service unavailable",
                 duration_ms=self._elapsed(start),
-                metadata={"actual_rows": actual_rows},
-                failure_summary=None,
+                failure_summary="DATA_VOLUME_SERVICE_UNAVAILABLE"
             )
 
-        baseline_rows = baseline.value
-        allowed_deviation = slo.get("allowed_deviation_pct", 15.0)
-        deviation_pct = ((actual_rows - baseline_rows) / baseline_rows * 100) if baseline_rows > 0 else 0
-
-        if abs(deviation_pct) <= allowed_deviation:
+        # Decision logic
+        if status == "FAIL":
+            result = GateResult.FAIL
+            detail = f"Row count anomalous: {deviation_pct:+.1f}% vs baseline"
+            failure_summary = f"VOLUME_ANOMALY:{deviation_pct:+.1f}%"
+        elif status == "WARN":
+            result = GateResult.WARN
+            detail = f"Row count deviation {deviation_pct:+.1f}% (within warning threshold) or baseline missing"
+            failure_summary = None
+        else:
             result = GateResult.PASS
             detail = "Row count within expected range"
-        else:
-            result = GateResult.FAIL
-            detail = f"Row count {deviation_pct:+.1f}% vs baseline"
+            failure_summary = None
 
         return GateOutcome(
             gate_name="G6_VOLUME",
@@ -1255,9 +1182,9 @@ class VolumeGate(Gate):
                 "actual_rows": actual_rows,
                 "baseline_rows": baseline_rows,
                 "deviation_pct": round(deviation_pct, 2),
-                "allowed_deviation_pct": allowed_deviation,
+                "allowed_deviation_pct": slo.get("allowed_deviation_pct", 15.0),
             },
-            failure_summary=f"VOLUME_ANOMALY:{deviation_pct:+.1f}%" if result == GateResult.FAIL else None,
+            failure_summary=failure_summary,
         )
 ```
 
@@ -2267,58 +2194,7 @@ checks the registry before falling back to URN parsing.
 
 ---
 
-## 10. C-09: Baselines Store
-
-### 10.1 Responsibility
-
-The Baselines Store maintains historical metrics (row counts, null rates, schema fingerprints) used by the Volume Gate (G6) for anomaly detection.
-
-### 10.2 DynamoDB Table: Baselines
-
-| Attribute | Type | Key | Description |
-|:---|:---|:---|:---|
-| `dataset_urn` | String | PK | Dataset identifier |
-| `metric_key` | String | SK | `row_count`, `null_rate:{column}`, `schema_fingerprint` |
-| `value` | Number | — | Current baseline value |
-| `source` | String | — | `7_day_rolling_avg` / `28_day_rolling_avg` / `synthetic` |
-| `confidence` | String | — | `HIGH` (≥7 runs), `MEDIUM` (3-6 runs), `LOW` (< 3 or synthetic) |
-| `history` | List<Map> | — | Last 28 data points |
-| `updated_at` | String (ISO) | — | Last computation time |
-
-### 10.3 Baseline Computation
-
-```python
-class BaselineComputer:
-    """Computes rolling baselines from evidence history."""
-
-    def compute_rolling_avg(self, dataset_urn: str, metric: str, window_days: int = 7) -> float:
-        history = self.store.get_history(dataset_urn, metric, window_days)
-        if len(history) < 3:
-            # Insufficient data — use synthetic baseline
-            return self._get_synthetic_baseline(dataset_urn, metric)
-        return sum(h["value"] for h in history) / len(history)
-
-    def _get_synthetic_baseline(self, dataset_urn: str, metric: str) -> float:
-        """Organizational tier averages as temporary baselines."""
-        tier = self.registry.get_dataset(dataset_urn).tier
-        return self.org_defaults.get(f"{tier}:{metric}", 0)
-
-    def update_after_validation(self, dataset_urn: str, actual_rows: int):
-        """Update rolling baseline with new data point."""
-        self.store.append_history(
-            dataset_urn=dataset_urn,
-            metric_key="row_count",
-            value=actual_rows,
-            timestamp=datetime.now(timezone.utc),
-        )
-        # Recompute baseline
-        new_baseline = self.compute_rolling_avg(dataset_urn, "row_count")
-        self.store.update_baseline(dataset_urn, "row_count", new_baseline)
-```
-
----
-
-## 11. Cross-Cutting Concerns
+## 10. Cross-Cutting Concerns
 
 ### 11.1 End-to-End Latency Budget
 
@@ -2373,7 +2249,7 @@ class BaselineComputer:
 
 ---
 
-## 12. Alternatives Considered
+## 11. Alternatives Considered
 
 | Decision | Chosen | Alternative | Why Chosen |
 |:---|:---|:---|:---|
@@ -2386,9 +2262,9 @@ class BaselineComputer:
 
 ---
 
-## 13. Testing Strategy
+## 12. Testing Strategy
 
-### 13.1 Unit Tests
+### 12.1 Unit Tests
 
 | Component | Test Focus | Coverage Target |
 |:---|:---|:---|
@@ -2398,7 +2274,7 @@ class BaselineComputer:
 | Evidence Sanitizer | PII pattern matching, recursive scrubbing | 100% |
 | Baseline Computer | Rolling average, synthetic fallback, history management | 90% |
 
-### 13.2 Integration Tests
+### 12.2 Integration Tests
 
 | Test | Components Under Test | Validation |
 |:---|:---|:---|
@@ -2409,7 +2285,7 @@ class BaselineComputer:
 | Freshness miss | Freshness Monitor + empty CertifiedViewState | FRESHNESS_MISS evidence emitted |
 | DLQ redrive | Queue → Worker crash → DLQ → manual reprocess | Message lands in DLQ after 3 retries |
 
-### 13.3 Load Tests
+### 12.3 Load Tests
 
 | Scenario | Target | Pass Criteria |
 |:---|:---|:---|
@@ -2418,7 +2294,7 @@ class BaselineComputer:
 | 5M row dataset validation | Single large dataset | Total validation time < 25s |
 | 20M row dataset with sampling | Sampling path | Total validation time < 15s |
 
-### 13.4 New Unit Tests (v1.1 additions)
+### 12.4 New Unit Tests (v1.1 additions)
 
 | Component | Test focus | Coverage target |
 |:----------|:----------|:----------------|
@@ -2428,7 +2304,7 @@ class BaselineComputer:
 | `dlq-inspector` Lambda | Auto-redrive hint for transient; HOLD for missing policy; SNS page at receive_count ≥ 3 | 90% |
 | `dlq-redriving` Lambda | Stale version skip; new `request_id` generation; filter by `dataset_urn` | 95% |
 
-### 13.5 New Integration Tests (v1.1 additions)
+### 12.5 New Integration Tests (v1.1 additions)
 
 | Test | Components under test | Validation |
 |:-----|:---------------------|:-----------|
@@ -2442,7 +2318,7 @@ class BaselineComputer:
 | KEDA scale-up | 100 `ValidationRequest`s queued simultaneously | Workers scale 3 → 20 within 60s; p99 validation < 30s |
 
 
-### 13.4 Chaos Tests
+### 12.6 Chaos Tests
 
 | Injection | Expected Behavior |
 |:---|:---|
@@ -2453,7 +2329,7 @@ class BaselineComputer:
 
 ---
 
-## 14. Open Items and ADR Dependencies
+## 13. Open Items and ADR Dependencies
 
 | ID | Item | Status | Owner | Dependency |
 |:---|:---|:---|:---|:---|
@@ -2467,7 +2343,7 @@ class BaselineComputer:
 
 ---
 
-## 15. Glossary
+## 14. Glossary
 
 | Term | Definition |
 |:---|:---|
@@ -2498,7 +2374,7 @@ Hook Dispatcher
 Validation Service Workers
   ├── reads: SQS FIFO (ValidationRequest)
   ├── reads: S3 (staged data via DuckDB)
-  ├── reads: DynamoDB (DatasetRegistry, Baselines)
+  ├── reads: DynamoDB (DatasetRegistry)
   ├── calls: Certified View Manager
   └── calls: Evidence Emitter
 
@@ -2534,7 +2410,6 @@ OpenLineage Collector
 | QuarantineIndex | `dataset_urn` | `partition_value` | On-demand | 30 days |
 | ReferentialIntegrityCache | `ref_urn` | — | On-demand | 24 h |
 | ColdDLQIndex | `request_id` | `dataset_urn` (GSI) | On-demand | 30 days |
-| Baselines | `dataset_urn` | `metric_key` | On-demand | None |
 
 ---
 
