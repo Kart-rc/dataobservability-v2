@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  localstack:
+    image: localstack/localstack:3.0.0
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=s3,sqs,sns,dynamodb,events
+      - DEBUG=1
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - "${LOCALSTACK_VOLUME_DIR:-./volume}:/var/lib/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+
+  hook-dispatcher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m src.hook_dispatcher.main
+    depends_on:
+      - localstack
+    environment:
+      - PYTHONUNBUFFERED=1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+      - LOCALSTACK_ENDPOINT=http://localstack:4566
+    volumes:
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+      - ./data:/tmp/s3_local
+
+  validation-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m src.validation_worker.main
+    depends_on:
+      - localstack
+    environment:
+      - PYTHONUNBUFFERED=1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+      - LOCALSTACK_ENDPOINT=http://localstack:4566
+    volumes:
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+      - ./data:/tmp/s3_local
