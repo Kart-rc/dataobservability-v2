@@ -48,8 +48,8 @@ The following assumptions underpin this design and must be validated before impl
 This LLD is organized by component, following the data flow from storage event to evidence emission:
 
 1. **C-01: Hook Dispatcher** — Receives and normalizes storage events
-2. **C-02: Validation Queue** — Buffers and orders validation requests
-3. **C-03: Validation Service (Workers)** — Runs the 6-gate pipeline
+2. **C-02: Validation Orchestrator (Step Functions)** — Routes and controls execution
+3. **C-03: Validation Engines (DuckDB & Spark)** — Runs the 6-gate pipeline
 4. **C-04: Certified View Manager** — Manages staging → certified promotion
 5. **C-05: Freshness Monitor** — Detects missing expected data
 6. **C-06: OpenLineage Collector** — Ingests lifecycle and lineage events
@@ -99,7 +99,7 @@ The Hook Dispatcher is a lightweight, stateless service that receives raw storag
 │  └──────────────────┬───────────────────────┘   │
 │                     │                            │
 │                     ▼                            │
-│              SQS FIFO Queue                      │
+│          Start Step Function Execution           │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -285,13 +285,9 @@ class ValidationRequest:
     engine_info: Optional[str]          # "Apache-Spark/3.5.1" (from Delta commit)
     correlation_id: Optional[str]       # dag_run_id, txnId, or None
 
-    def to_sqs_message(self) -> dict:
-        """Serialize for SQS FIFO queue."""
-        return {
-            "MessageBody": json.dumps(asdict(self), default=str),
-            "MessageGroupId": self.dataset_urn,  # FIFO ordering per dataset
-            "MessageDeduplicationId": self.request_id,
-        }
+    def to_step_function_input(self) -> str:
+        """Serialize for Step Function Execution Input."""
+        return json.dumps(asdict(self), default=str)
 ```
 
 ### 2.5 Deduplication
@@ -387,249 +383,152 @@ class DeduplicationStore:
 
 ---
 
-## 3. C-02: Validation Queue
+## 3. C-02: Validation Orchestrator (Step Functions)
 
 ### 3.1 Responsibility
 
-The Validation Queue buffers `ValidationRequest` messages between the Hook Dispatcher and the Validation Service workers. It provides FIFO ordering per dataset to prevent out-of-order validation and ensures at-least-once delivery.
+The Validation Orchestrator uses AWS Step Functions to manage the lifecycle of a `ValidationRequest`. It guarantees at-least-once execution, determines the optimal compute engine based on data volume, and provides robust Saga-pattern error handling, replacing the need for complex custom Dead Letter Queue (DLQ) re-drive scripts.
 
-### 3.2 Queue Configuration
+### 3.2 State Machine Architecture
 
-```python
-QUEUE_CONFIG = {
-    "QueueName": "signal-factory-validation-requests.fifo",
-    "Attributes": {
-        "FifoQueue": "true",
-        "ContentBasedDeduplication": "false",  # We use explicit dedup IDs
-        "VisibilityTimeout": "600",            # 10 minutes (max validation time)
-        "MessageRetentionPeriod": "86400",     # 24 hours
-        "ReceiveMessageWaitTimeSeconds": "20",  # Long polling
-        "DeduplicationScope": "messageGroup",  # Per-dataset dedup
-        "FifoThroughputLimit": "perMessageGroupId",  # High throughput mode
+```json
+{
+  "StartAt": "ComputeTierAnalyzer",
+  "States": {
+    "ComputeTierAnalyzer": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:region:account:function:ComputeRouter",
+      "Next": "RouteByComputeTier"
     },
-}
-
-DLQ_CONFIG = {
-    "QueueName": "signal-factory-validation-requests-dlq.fifo",
-    "Attributes": {
-        "FifoQueue": "true",
-        "MessageRetentionPeriod": "1209600",  # 14 days
+    "RouteByComputeTier": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.compute_tier",
+          "StringEquals": "DUCKDB_FARGATE",
+          "Next": "RunDuckDBValidation"
+        },
+        {
+          "Variable": "$.compute_tier",
+          "StringEquals": "SPARK_SERVERLESS",
+          "Next": "RunSparkValidation"
+        }
+      ],
+      "Default": "FailState"
     },
+    "RunDuckDBValidation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "Cluster": "ValidationCluster",
+        "TaskDefinition": "DuckDBWorker",
+        "Overrides": {
+          "ContainerOverrides": [{
+            "Name": "Worker",
+            "Environment": [{"Name": "PAYLOAD", "Value.$": "States.JsonToString($)"}]
+          }]
+        }
+      },
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 10, "MaxAttempts": 3 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "HandleValidationFailure" }],
+      "Next": "PublishSuccess"
+    },
+    "RunSparkValidation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::emr-serverless:startJobRun.waitForTaskToken",
+      "Parameters": {
+        "ApplicationId": "SparkAppId",
+        "ExecutionRoleArn": "ExecutionRole",
+        "JobDriver": {
+          "SparkSubmit": {
+            "EntryPoint": "s3://scripts/validation_spark.py",
+            "EntryPointArguments": ["--payload", "States.JsonToString($)", "--task-token", "$$.Task.Token"]
+          }
+        }
+      },
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 30, "MaxAttempts": 3 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "HandleValidationFailure" }],
+      "Next": "PublishSuccess"
+    },
+    "PublishSuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "End": true
+    },
+    "HandleValidationFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:region:account:function:FailureSagaHandler",
+      "End": true
+    },
+    "FailState": {
+      "Type": "Fail"
+    }
+  }
 }
-
-REDRIVE_POLICY = {
-    "deadLetterTargetArn": "<dlq-arn>",
-    "maxReceiveCount": 3,
-}
 ```
 
-### 3.3 Message Flow
+### 3.3 Compute Tier Routing (Lambda)
 
-```
-ValidationRequest (JSON)
-  │
-  ├── MessageGroupId: dataset_urn         → FIFO ordering per dataset
-  ├── MessageDeduplicationId: request_id  → Exactly-once within 5-min window
-  └── MessageBody: serialized request     → Full ValidationRequest payload
-```
+The first step in the state machine is the `ComputeRouter` Lambda. It evaluates the incoming `ValidationRequest` to determine if the workload fits within the fast DuckDB container or requires a heavy Spark cluster.
 
-### 3.4 Capacity Model
-
-| Parameter | Value | Rationale |
-|:---|:---|:---|
-| Peak validation requests/hour | 500 | HLD NFR: 500 validations/hour |
-| Burst window (02:00–03:00 ET) | 300 requests in 30 min | 200 batch jobs × 1.5 avg requests/job |
-| Message size (avg) | ~2 KB | ValidationRequest JSON serialization |
-| FIFO throughput | 300 msg/s per group (high throughput mode) | AWS SQS FIFO limit with batching |
-| Visibility timeout | 600s (10 min) | Max validation time for 5M row dataset |
-
-### 3.5 Backpressure
-
-If workers cannot keep up with enqueue rate, the queue depth grows. Monitoring and auto-scaling respond:
-
-| Queue Depth | Action |
-|:---|:---|
-| < 50 | Normal — steady state |
-| 50–200 | Scale up: add 2 validation workers via HPA |
-| 200–500 | Scale up: add 5 workers; emit `queue.depth.high` alert |
-| > 500 | **Circuit breaker**: pause non-Tier-1 validation; alert on-call |
-
-### 3.6 DLQ Reprocessing Workflow
-
-When validation workers crash or fail repeatedly, messages land in the DLQ
-(`signal-factory-validation-requests-dlq.fifo`, 14-day retention). This section
-specifies how operators triage and safely re-enqueue them.
-
-#### Architecture
-
-```
-signal-factory-validation-requests-dlq.fifo
-  │
-  ├── dlq-inspector  (Lambda, every 5 min)
-  │     ├── Peeks up to 10 messages (30s visibility timeout)
-  │     ├── Publishes summary to CloudWatch Logs Insights
-  │     └── SNS alert if receive_count ≥ 3
-  │
-  └── dlq-redriving  (Lambda, manual trigger via Function URL + IAM)
-        ├── Reads target messages from DLQ
-        ├── Checks CertifiedViewState — drops stale validations
-        ├── Re-enqueues with new request_id (resets 24h dedup window)
-        └── Deletes original DLQ message after successful re-enqueue
-```
-
-#### `dlq-inspector` Lambda
+**Routing Heuristics:**
+*   **DUCKDB_FARGATE**: `num_files` < 5,000 OR `total_bytes` < 50 GB. (Handles 95% of micro-batches).
+*   **SPARK_SERVERLESS**: `num_files` >= 5,000 OR `total_bytes` >= 50 GB. (Handles massive backfills or historical rewrites).
 
 ```python
-def inspect_dlq(event, context):
-    messages = sqs.receive_message(
-        QueueUrl=DLQ_URL,
-        MaxNumberOfMessages=10,
-        VisibilityTimeout=30,      # peek without consuming
-        WaitTimeSeconds=0,
-    ).get("Messages", [])
-
-    summaries = []
-    for msg in messages:
-        body = json.loads(msg["Body"])
-        summaries.append({
-            "request_id": body.get("request_id"),
-            "dataset_urn": body.get("dataset_urn"),
-            "storage_type": body.get("storage_type"),
-            "partition_values": body.get("partition_values"),
-            "original_timestamp": body.get("timestamp"),
-            "receive_count": msg["Attributes"]["ApproximateReceiveCount"],
-            "triage_hint": _classify_failure(body, msg),
-        })
-
-    logger.info(json.dumps({"dlq_summary": summaries}))
-
-    critical = [s for s in summaries if int(s["receive_count"]) >= 3]
-    if critical:
-        sns.publish(
-            TopicArn=OPS_ALERT_TOPIC,
-            Message=json.dumps({"alert": "DLQ_CRITICAL", "messages": critical}),
-            Subject="Signal Factory: DLQ messages exhausted retries",
-        )
-
-
-def _classify_failure(body: dict, msg: dict) -> str:
-    receive_count = int(msg["Attributes"]["ApproximateReceiveCount"])
-    dataset_urn = body.get("dataset_urn", "")
-
-    if receive_count >= 3:
-        return "COLD_DLQ: move to cold storage; page on-call"
-    if not registry.dataset_exists(dataset_urn):
-        return "HOLD: dataset not registered; fix registry before redriving"
-    if not registry.policy_bundle_exists(dataset_urn):
-        return "HOLD: policy bundle missing; bootstrap dataset first"
-    return "AUTO_REDRIVE: transient failure; safe to re-enqueue"
+def route_compute(event, context):
+    num_files = event.get("num_files", 0)
+    total_bytes = event.get("total_bytes", 0)
+    
+    tier = "DUCKDB_FARGATE"
+    if num_files > 5000 or total_bytes > (50 * 1024**3):
+        tier = "SPARK_SERVERLESS"
+        
+    event["compute_tier"] = tier
+    return event
 ```
 
-#### `dlq-redriving` Lambda
+### 3.4 Error Handling & Sagas
 
-Triggered manually by an operator via Lambda Function URL (IAM auth required).
-Accepts `{ "dataset_urn": "ds://...", "max_messages": 10 }`.
+By utilizing Step Functions, we eliminate the need for manual DLQ inspection.
 
-```python
-def redrive_messages(event, context):
-    target_urn = event.get("dataset_urn")
-    max_msgs = min(event.get("max_messages", 10), 50)
-
-    redriven = 0
-    while redriven < max_msgs:
-        messages = sqs.receive_message(
-            QueueUrl=DLQ_URL,
-            MaxNumberOfMessages=min(10, max_msgs - redriven),
-            VisibilityTimeout=120,
-        ).get("Messages", [])
-        if not messages:
-            break
-
-        for msg in messages:
-            body = json.loads(msg["Body"])
-            if target_urn and body.get("dataset_urn") != target_urn:
-                continue
-
-            # Safety: skip if the certified view has already advanced past this version
-            current_version = certified_view_state.get_version(body["dataset_urn"])
-            original_version = body.get("commit_version")
-            if original_version and current_version and current_version > original_version:
-                logger.warning(
-                    f"Skipping stale: version {original_version} superseded by {current_version}"
-                )
-                sqs.delete_message(QueueUrl=DLQ_URL, ReceiptHandle=msg["ReceiptHandle"])
-                continue
-
-            # New request_id resets the 24h dedup window
-            body["request_id"] = f"vr-{ulid.new()}"
-            sqs.send_message(
-                QueueUrl=MAIN_QUEUE_URL,
-                MessageBody=json.dumps(body),
-                MessageGroupId=body["dataset_urn"],
-                MessageDeduplicationId=body["request_id"],
-            )
-            sqs.delete_message(QueueUrl=DLQ_URL, ReceiptHandle=msg["ReceiptHandle"])
-            redriven += 1
-
-    return {"redriven": redriven}
-```
-
-#### Triage Reference
-
-| Failure type | Action | Owner |
-|:-------------|:-------|:------|
-| Registry lookup failure (transient) | `dlq-inspector` auto-redrive hint | Operator invokes `dlq-redriving` |
-| Policy bundle not found | HOLD — bootstrap dataset first | Platform engineer |
-| Data read timeout (large partition) | Adjust `sampling.threshold_rows` in policy bundle, then redrive | Platform engineer |
-| Receive count ≥ 3 | `dlq-inspector` auto-pages on-call; move to cold DLQ | On-call |
-| Certified view already advanced past this version | `dlq-redriving` drops message silently | Automatic |
-
-#### New DynamoDB Table — `ColdDLQIndex`
-
-| Attribute | Type | Key | Description |
-|:----------|:-----|:----|:------------|
-| `request_id` | String | PK | Original ULID |
-| `dataset_urn` | String | GSI-PK | Enables per-dataset cold DLQ queries |
-| `receive_count` | Number | — | Receive count at time of cold-DLQ move |
-| `failure_snapshot` | String | — | JSON `ValidationRequest` (truncated at 64 KB) |
-| `moved_at` | String | — | ISO timestamp |
-| `ttl` | Number | — | 30 days |
+*   **Transient Failures**: Both `RunDuckDBValidation` and `RunSparkValidation` tasks utilize built-in `Retry` blocks with exponential backoff for network or provisioning failures.
+*   **Validation Failures**: If the data fails the 6-gate process (e.g., Schema mismatch), the code throws an error caught by the `Catch` block, routing to `HandleValidationFailure`.
+*   **Failure Saga**: The `FailureSagaHandler` Lambda is responsible for executing compensation actions, such as locking the Certified View Manager to prevent data from serving to downstream consumers, and alerting PagerDuty.
 
 ---
 
-## 4. C-03: Validation Service (Workers)
+## 4. C-03: Validation Engines (DuckDB & Spark)
 
 ### 4.1 Responsibility
 
-The Validation Service is a fleet of **stateless, horizontally-scalable** worker pods (EKS) that consume `ValidationRequest` messages from the queue and execute the 6-gate validation pipeline. Each worker reads committed data from the staging path, evaluates gates sequentially, and emits results to the Evidence Emitter.
+The Validation Engines form the execution layer that runs the configured 6-gate validation pipeline against the newly committed data. Unlike the previous design that used only DuckDB, this tier utilizes two different engines based on the payload size routed from the Step Function Orchestrator:
+- **DuckDB (ECS Fargate)** for low-latency micro-batches (95% of workloads).
+- **Apache Spark (EMR Serverless)** for massive data backfills.
 
-### 4.2 Worker Architecture
+### 4.2 Engine Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                   Validation Worker Pod                   │
-│                                                          │
-│  ┌──────────────┐                                       │
-│  │ SQS Consumer  │ ← Polls ValidationRequest messages   │
-│  └──────┬───────┘                                       │
-│         │                                                │
-│         ▼                                                │
-│  ┌──────────────────────────────────────────────┐       │
-│  │           Gate Pipeline Orchestrator           │       │
-│  │                                                │       │
-│  │  G1: Resolution → G2: Identity → G3: Schema   │       │
-│  │       → G4: Contract → G5: Freshness           │       │
-│  │            → G6: Volume                         │       │
-│  │                                                │       │
-│  │  [Fail-fast: pipeline halts on first FAIL       │       │
-│  │   for Tier-1; completes all gates for Tier-2/3] │       │
-│  └──────────────────┬───────────────────────────┘       │
-│                     │                                    │
-│  ┌─────────┐  ┌────┴─────┐  ┌──────────────────────┐  │
-│  │ DuckDB   │  │ Evidence  │  │ Certified View Mgr   │  │
-│  │ Engine   │  │ Emitter   │  │ (promote/hold)       │  │
-│  └─────────┘  └──────────┘  └──────────────────────┘  │
-└─────────────────────────────────────────────────────────┘
+│     Step Function Execution (RunValidation Task)        │
+└────────┬───────────────────────────────────────┬────────┘
+         │ (Fargate Task)                        │ (EMR JobRun)
+         ▼                                       ▼
+┌──────────────────────┐               ┌──────────────────────┐
+│  DuckDB Worker Pod   │               │ Spark Serverless App │
+│                      │               │                      │
+│ ┌──────────────────┐ │               │ ┌──────────────────┐ │
+│ │ Gate Orchestrator│ │               │ │ Gate Orchestrator│ │
+│ │ (Python/DuckDB)  │ │               │ │ (Scala/PySpark)  │ │
+│ └────────┬─────────┘ │               │ └────────┬─────────┘ │
+└──────────┼───────────┘               └──────────┼───────────┘
+           │                                      │
+           ▼                                      ▼
+    ┌────────────┐                         ┌────────────┐
+    │  Evidence  │                         │ Step Func  │
+    │  Emitter   │                         │ Task Token │
+    └────────────┘                         │ Callback   │
+                                           └────────────┘
 ```
 
 ### 4.3 Data Reader — DuckDB Engine
@@ -711,6 +610,48 @@ class DataReader:
 
     def close(self):
         self.conn.close()
+```
+
+### 4.4 Data Reader — Spark Engine (EMR Serverless)
+
+For massive workloads, EMR Serverless provisions a distributed Spark cluster. The Spark application executes the exact same 6 gates using PySpark DataFrame operations instead of DuckDB SQL.
+
+Crucially, because AWS Step Functions is managing the execution state, the Spark job receives a `TaskToken`. When the Spark job completes all validations, it must use the boto3 `stepfunctions` client to return the result, completing the Saga.
+
+```python
+import sys
+import boto3
+from pyspark.sql import SparkSession
+
+def main():
+    payload = parse_args(sys.argv)
+    task_token = payload["task_token"]
+    
+    spark = SparkSession.builder.appName(f"Validation-{payload['dataset_urn']}").getOrCreate()
+    sfn_client = boto3.client('stepfunctions')
+    
+    try:
+        # Load Delta or Parquet data using Spark
+        df = load_data(spark, payload["table_path"], payload["storage_type"])
+        
+        # Execute Gates
+        results = execute_gates(df, payload)
+        
+        # Callback to Step Function Success
+        sfn_client.send_task_success(
+            taskToken=task_token,
+            output=json.dumps({"status": "SUCCESS", "results": results})
+        )
+    except Exception as e:
+        # Callback to Step Function Failure -> Triggers Failure Saga
+        sfn_client.send_task_failure(
+            taskToken=task_token,
+            error=type(e).__name__,
+            cause=str(e)
+        )
+
+if __name__ == "__main__":
+    main()
 ```
 
 ### 4.4 Gate Pipeline — Detailed Implementation
