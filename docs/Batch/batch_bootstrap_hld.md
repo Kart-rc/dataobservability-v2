@@ -1,10 +1,10 @@
 # Signal Factory: Batch Bootstrap & Autopilot — High-Level Design
 
-> **Version:** 1.0  
-> **Date:** February 16, 2026  
-> **Status:** Draft  
-> **Scope:** One-Time Bootstrap Onboarding & Autopilot-Driven Adoption for Batch Observability  
-> **Parent Documents:** `batch_observability_prd.md` (v1.1), `batch_observability_hld.md` (v2.0), `batch_observability_postwrite_hld.md` (v1.0)  
+> **Version:** 1.1
+> **Date:** February 23, 2026
+> **Status:** Draft — Feasibility Refinement
+> **Scope:** One-Time Bootstrap Onboarding & Autopilot-Driven Adoption for Batch Observability
+> **Parent Documents:** `batch_observability_prd.md` (v1.1), `batch_observability_hld.md` (v2.0), `batch_observability_postwrite_hld.md` (v1.0)
 > **Challenges Reference:** `batch_observability_challenges.md` (Principal Architect Review)
 
 ---
@@ -26,6 +26,20 @@ This HLD defines the architecture, workflows, data models, and automation strate
 | **Synthetic Baselines** | New datasets with < 7 days of history use organizational tier averages as temporary baselines |
 | **Approval, Not Authoring** | For Tier-2/3, the human role shifts from writing policies to reviewing auto-generated ones |
 | **Bootstrap → Run-the-Engine Handoff** | Clear, deterministic transition: a dataset is "signal-ready" when it has a valid `policy_bundle.yaml` and a Certified View pointer |
+| **Fail-Open by Default** | Bootstrap-generated policies must protect production jobs by degrading SDK failures to evidence (`SDK_DEGRADED`) rather than failing pipelines |
+| **Two-Phase Readiness** | Datasets become `MONITORING_READY` first, and only transition to `FULL_SIGNAL_READY` after baseline confidence and evidence completeness are proven |
+
+### Feasibility Refinements from Bootstrap Assessment
+
+The bootstrap design was re-assessed against the risks captured in `batch_observability_challenges.md`, the batch platform HLD, and post-write architecture docs. The following refinements are required to make fleet-scale rollout feasible:
+
+| Identified Challenge | Why It Threatens Feasibility | Refinement in This Proposal |
+|:---|:---|:---|
+| **Inline SDK introduces new failure domain** | SDK crashes can fail production jobs and stall adoption | Treat **fail-open** as a hard invariant for bootstrap-generated configs. Bootstrap cannot mark a dataset as ready unless `validation_enabled=true` and `failure_mode=warn_and_emit` are both present in policy metadata. |
+| **Cold-start + low history datasets** | Tier-1/2 datasets without 7 partitions would generate noisy volume signals | Introduce a distinct readiness state: **MONITORING_READY** (freshness + schema only) before **FULL_SIGNAL_READY**. Volume and contract checks activate only after confidence thresholds are met. |
+| **Approval queues become bottlenecks** | Tier-2/3 PR backlog blocks bootstrap SLA | Add escalation SLOs by tier and auto-reassignment after timeout. Tier-3 auto-merge remains allowed but only when risk score is LOW and no policy conflicts exist. |
+| **Evidence ambiguity (SDK down vs no data)** | False alerts and poor trust in early rollout | Require heartbeat and expected-evidence cardinality metadata to be registered during bootstrap so run-time can disambiguate no-data from instrumentation failure. |
+| **Schema/format migrations during onboarding** | Repeated restarts can trap datasets in bootstrap loops | Add migration-aware reprofiling logic with bounded retries and fallback to contract-lite if format migration is detected mid-bootstrap. |
 
 ---
 
@@ -198,6 +212,17 @@ stateDiagram-v2
 ```
 
 ---
+
+
+### 3.2 Feasibility Guardrails (Mandatory)
+
+| Guardrail | Enforcement Point | Outcome |
+|:---|:---|:---|
+| **Fail-open invariant** | Gateway signing rejects bundles without fail-open metadata | Prevents bootstrap from introducing job-fail behavior in production |
+| **Readiness split** (`MONITORING_READY` vs `FULL_SIGNAL_READY`) | Bootstrap state machine + fleet dashboard | Avoids overpromising detection quality on immature baselines |
+| **Evidence completeness contract** (`expected_gate_count`, heartbeat cadence) | dataset registration + policy generation | Enables runtime detection of partial evidence and bus outages |
+| **Migration-aware reprofiling cap** (max 2 restarts) | Profiling step controller | Prevents endless loops during Delta↔Parquet migration |
+| **Approval deadlock breaker** | Approval router + escalation ownership map | Keeps Tier-1/2 SLAs feasible at 500-dataset scale |
 
 ## 4. Step 1 — Registration
 
@@ -741,6 +766,11 @@ The Bootstrap process adapts its final output depending on the chosen enforcemen
 | **Schema changes during bootstrap** | Re-profile if schema fingerprint changes between Step 2 and Step 4 |
 | **Dataset decommissioned during bootstrap** | Cancel bootstrap; mark state as `CANCELLED` |
 | **Concurrent bootstrap attempts** | Idempotency check on `dataset_urn`; reject duplicate bootstrap |
+| **Evidence Bus unavailable during bootstrap validation run** | Mark dataset `MONITORING_READY_BLOCKED`; retry handshake every 15 min and block full readiness until recovered |
+| **Repository scanner detects conflicting owners (CODEOWNERS vs metadata)** | Route to manual ownership adjudication queue; prevent auto-merge until owner is canonicalized |
+| **Partition key missing or inconsistent across 7-day sample** | Force contract-lite only, attach `partition_key_required` action item, and skip volume baseline activation |
+| **Tier-3 auto-merge PR modified by non-Autopilot actor** | Cancel auto-merge and require human review to avoid unsafe privilege escalation |
+| **Format migration detected (Parquet→Delta or Delta→Parquet) mid-bootstrap** | Freeze current bootstrap, fork new bootstrap execution with migration flag and preserve prior artifacts for audit |
 
 ### 10.2 Bootstrap Rollback
 

@@ -1,11 +1,11 @@
 # Signal Factory: Batch Bootstrap & Onboarding — Low-Level Design
 
-> **Version:** 1.0  
-> **Date:** February 17, 2026  
-> **Status:** Draft — Self-Review Complete  
-> **Classification:** Internal — Architecture  
-> **Parent Documents:** `batch_bootstrap_hld.md` (v1.0), `batch_observability_hld.md` (v2.0), `batch_observability_prd.md` (v1.1)  
-> **Scope:** Delta Lake and Parquet storage formats only (Iceberg deferred to Phase 2)  
+> **Version:** 1.1
+> **Date:** February 23, 2026
+> **Status:** Draft — Feasibility Refinement
+> **Classification:** Internal — Architecture
+> **Parent Documents:** `batch_bootstrap_hld.md` (v1.1), `batch_observability_hld.md` (v2.0), `batch_observability_prd.md` (v1.1)
+> **Scope:** Delta Lake and Parquet storage formats only (Iceberg deferred to Phase 2)
 > **Author:** Principal Solutions Architect
 
 ---
@@ -59,6 +59,18 @@ This LLD is organized by component, following the bootstrap lifecycle from datas
 9. **C-09: Fleet Dashboard Exporter** — Emits bootstrap progress metrics
 
 ### 1.5 Requirements Traceability
+
+
+### 1.6 Feasibility Constraints Added in v1.1
+
+This revision adds implementation constraints required to keep bootstrap operationally feasible at 500-dataset scale:
+
+1. **Two-phase readiness contract** — state machine now differentiates `MONITORING_READY` (schema/freshness signal only) from `FULL_SIGNAL_READY` (volume/contract/PII active).
+2. **Fail-open enforcement invariant** — policy signing rejects any generated bundle that can fail the host job due to SDK internals.
+3. **Evidence completeness metadata** — bootstrap registers expected gate cardinality + heartbeat cadence so downstream engines can detect partial evidence.
+4. **Migration-aware reprofiling cap** — schema-format migration during bootstrap can trigger at most two reprofile loops before forced contract-lite fallback.
+5. **Approval deadlock controls** — approval ownership is re-routed automatically after timeout to avoid queue starvation.
+
 
 | PRD Goal | HLD Component | LLD Coverage | Section |
 |:---|:---|:---|:---|
@@ -550,7 +562,31 @@ CONCURRENCY_CONFIG = {
 | TIER_2 | 240 hours (10 days) | 30 min | 168 hours (7 days) | 10 min |
 | TIER_3 | 72 hours (3 days) | 15 min | 48 hours (auto) | 10 min |
 
-### 2.8 Error Handling
+
+### 2.8 Readiness Model (v1.1 Refinement)
+
+| State | Minimum Preconditions | Enabled Engines | Exit Criteria |
+|:---|:---|:---|:---|
+| `MONITORING_READY` | Registration + signed fail-open policy + initial certification + heartbeat contract | Freshness, lifecycle, schema drift | 7 successful runs and evidence completeness >= 99% |
+| `FULL_SIGNAL_READY` | Confidence `MEDIUM` or above for baseline + no unresolved approval conflicts | Freshness + volume + contract + PII + DQ | Standard run-the-engine lifecycle |
+
+> [!IMPORTANT]
+> Fleet coverage metrics must report both readiness levels separately. Counting `MONITORING_READY` as full coverage is explicitly disallowed.
+
+### 2.9 Feasibility Controls
+
+```python
+FEASIBILITY_CONTROLS = {
+    "fail_open_required": True,
+    "heartbeat_interval_seconds": 60,
+    "expected_evidence_model": "gate_count_x_stage_count",
+    "max_migration_reprofile_loops": 2,
+    "approval_reroute_after_hours": {"TIER_1": 24, "TIER_2": 48},
+    "tier3_auto_merge_requires_low_risk": True,
+}
+```
+
+### 2.10 Error Handling
 
 | Failure Scenario | Behavior | Recovery |
 |:---|:---|:---|
@@ -565,8 +601,13 @@ CONCURRENCY_CONFIG = {
 | Schema changes during bootstrap | Re-profile if schema fingerprint changes between Steps 2–4 | Detected in `InitCertifiedView` Lambda |
 | Concurrent bootstrap on same URN | Reject duplicate; return existing `bootstrap_id` | API-level idempotency check |
 | Step Functions execution quota | Queue overflow in SQS FIFO | Polled by EventBridge scheduler |
+| Evidence Bus handshake fails during readiness check | Keep dataset in `MONITORING_READY`; set readiness_block_reason | Retry handshake + emit `bootstrap.readiness_blocked` metric |
+| Owner conflict detected between CODEOWNERS and registry metadata | Auto-approval disabled for Tier-2/3 | Manual adjudication queue + ownership patch PR |
+| Partition key inconsistent across sampled partitions | Volume baseline marked UNRELIABLE | Enforce contract-lite and require owner-supplied partition key override |
+| Format migration detected mid-bootstrap | Increment migration loop counter and restart profiling | After 2 loops, force synthetic baseline + escalation ticket |
+| Tier-3 PR changes after risk score generated | Auto-merge token invalidated | Recompute risk and require human approval |
 
-### 2.9 Observability
+### 2.11 Observability
 
 | Metric | Type | Alert Threshold |
 |:---|:---|:---|
@@ -579,8 +620,12 @@ CONCURRENCY_CONFIG = {
 | `bootstrap.stuck_count` | Gauge | > 0 in same step for > 24h |
 | `bootstrap.approval_wait_hours` | Histogram (by tier) | > approval_timeout × 0.5 |
 | `bootstrap.overflow_queue_depth` | Gauge | > 50 |
+| `bootstrap.monitoring_ready.count` | Gauge | Sudden growth without FULL transition > 7 days |
+| `bootstrap.readiness_blocked` | Counter (by reason) | > 0 for Tier-1 |
+| `bootstrap.evidence_completeness_pct` | Histogram | p95 < 99% after MONITORING_READY |
+| `bootstrap.migration_loop_count` | Histogram | Any value > 2 (should be impossible) |
 
-### 2.10 Deployment
+### 2.12 Deployment
 
 | Property | Value |
 |:---|:---|
