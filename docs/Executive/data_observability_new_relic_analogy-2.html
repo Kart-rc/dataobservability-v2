@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data Observability — The New Relic Analogy, and Where It Breaks</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page:        #f9f9f7;
+    --surface-1:   #fcfcfb;
+    --ink:         #0b0b0b;
+    --ink-2:       #52514e;
+    --muted:       #898781;
+    --grid:        #e1e0d9;
+    --baseline:    #c3c2b7;
+    --border:      rgba(11,11,11,0.10);
+    --series-1:    #2a78d6;  /* blue  — APM / infra lens */
+    --series-2:    #eb6834;  /* orange — data lens */
+    --series-7:    #4a3aa7;  /* violet — lineage */
+    --good:        #0ca30c;
+    --good-text:   #006300;
+    --warning:     #fab219;
+    --serious:     #ec835a;
+    --critical:    #d03b3b;
+    --blue-wash:   #cde2fb;
+    --blue-mid:    #86b6ef;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page:      #0d0d0d;
+      --surface-1: #1a1a19;
+      --ink:       #ffffff;
+      --ink-2:     #c3c2b7;
+      --muted:     #898781;
+      --grid:      #2c2c2a;
+      --baseline:  #383835;
+      --border:    rgba(255,255,255,0.10);
+      --series-1:  #3987e5;
+      --series-2:  #d95926;
+      --series-7:  #9085e9;
+      --good-text: #0ca30c;
+      --blue-wash: #104281;
+      --blue-mid:  #1c5cab;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:      #0d0d0d;
+    --surface-1: #1a1a19;
+    --ink:       #ffffff;
+    --ink-2:     #c3c2b7;
+    --muted:     #898781;
+    --grid:      #2c2c2a;
+    --baseline:  #383835;
+    --border:    rgba(255,255,255,0.10);
+    --series-1:  #3987e5;
+    --series-2:  #d95926;
+    --series-7:  #9085e9;
+    --good-text: #0ca30c;
+    --blue-wash: #104281;
+    --blue-mid:  #1c5cab;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--page);
+    color: var(--ink);
+    line-height: 1.55;
+  }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 0 20px; }
+
+  /* ---------- top nav ---------- */
+  nav {
+    position: sticky; top: 0; z-index: 50;
+    background: var(--page);
+    border-bottom: 1px solid var(--grid);
+  }
+  nav .wrap { display: flex; align-items: center; gap: 4px; overflow-x: auto; padding: 10px 20px; }
+  nav a {
+    color: var(--ink-2); text-decoration: none; font-size: 13.5px; font-weight: 500;
+    padding: 6px 12px; border-radius: 999px; white-space: nowrap;
+  }
+  nav a:hover { background: var(--surface-1); color: var(--ink); box-shadow: inset 0 0 0 1px var(--border); }
+  nav .theme-btn {
+    margin-left: auto; cursor: pointer; border: 1px solid var(--border); background: var(--surface-1);
+    color: var(--ink-2); border-radius: 999px; padding: 5px 12px; font-size: 13px; font-family: inherit;
+  }
+
+  /* ---------- hero ---------- */
+  header { padding: 52px 0 28px; }
+  .kicker { font-size: 12.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--series-1); font-weight: 700; }
+  h1 { font-size: clamp(26px, 4vw, 38px); line-height: 1.15; margin: 10px 0 14px; letter-spacing: -0.01em; }
+  .lede { font-size: 17px; color: var(--ink-2); max-width: 62ch; }
+  .lede strong { color: var(--ink); }
+
+  h2 { font-size: 22px; margin-bottom: 6px; letter-spacing: -0.01em; }
+  h3 { font-size: 16px; }
+  section { padding: 34px 0; border-top: 1px solid var(--grid); }
+  .section-sub { color: var(--ink-2); font-size: 14.5px; max-width: 68ch; margin-bottom: 22px; }
+
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 14px; padding: 20px;
+  }
+
+  /* ---------- problem statement toggle ---------- */
+  .lens-toggle { display: inline-flex; background: var(--surface-1); border: 1px solid var(--border); border-radius: 999px; padding: 4px; margin-bottom: 18px; }
+  .lens-toggle button {
+    font-family: inherit; font-size: 14px; font-weight: 600; cursor: pointer;
+    border: none; background: transparent; color: var(--ink-2);
+    padding: 8px 18px; border-radius: 999px; transition: background .15s, color .15s;
+  }
+  .lens-toggle button.active-apm  { background: var(--series-1); color: #fff; }
+  .lens-toggle button.active-data { background: var(--series-2); color: #fff; }
+
+  .lens-panel { display: none; }
+  .lens-panel.show { display: block; animation: fadein .25s ease; }
+  @keyframes fadein { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: none;} }
+
+  .ps-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 14px; }
+  @media (max-width: 760px) { .ps-grid { grid-template-columns: 1fr; } }
+  .ps-cell { border: 1px solid var(--border); border-radius: 12px; padding: 16px; background: var(--surface-1); }
+  .ps-cell .label { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 700; margin-bottom: 8px; }
+  .ps-cell p { font-size: 14.5px; color: var(--ink-2); }
+  .ps-cell p b { color: var(--ink); }
+  .quote {
+    border-left: 3px solid var(--series-2); padding: 10px 16px; margin: 18px 0 4px;
+    color: var(--ink-2); font-size: 15px; background: var(--surface-1); border-radius: 0 10px 10px 0;
+  }
+  .quote b { color: var(--ink); }
+
+  /* ---------- pipeline demo ---------- */
+  .pipe-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 18px; }
+  .pill-btn {
+    font-family: inherit; font-size: 13.5px; font-weight: 600; cursor: pointer;
+    border: 1px solid var(--border); background: var(--surface-1); color: var(--ink-2);
+    padding: 8px 16px; border-radius: 999px;
+  }
+  .pill-btn:hover { color: var(--ink); }
+  .pill-btn.on-infra { background: var(--series-1); border-color: var(--series-1); color: #fff; }
+  .pill-btn.on-data  { background: var(--series-2); border-color: var(--series-2); color: #fff; }
+
+  .pipeline { display: flex; align-items: stretch; gap: 0; overflow-x: auto; padding: 8px 0 4px; }
+  .node { flex: 1; min-width: 132px; display: flex; flex-direction: column; align-items: center; text-align: center; position: relative; }
+  .node .box {
+    width: 100%; border: 1.5px solid var(--baseline); border-radius: 12px; background: var(--surface-1);
+    padding: 12px 8px 10px; transition: border-color .2s, box-shadow .2s; cursor: default;
+  }
+  .node .nm { font-weight: 700; font-size: 13.5px; }
+  .node .role { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+  .node .st { margin-top: 8px; font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 999px; }
+  .st.ok   { color: var(--good-text); background: color-mix(in srgb, var(--good) 12%, transparent); }
+  .st.bad  { color: var(--critical); background: color-mix(in srgb, var(--critical) 12%, transparent); }
+  .st.warn { color: var(--ink); background: color-mix(in srgb, var(--warning) 22%, transparent); }
+  .arrow { display: flex; align-items: center; color: var(--baseline); font-size: 18px; padding: 0 4px; margin-top: -26px; }
+  .node .detail { font-size: 11.5px; color: var(--ink-2); margin-top: 8px; min-height: 46px; padding: 0 2px; }
+  .pipe-caption { margin-top: 12px; font-size: 14px; color: var(--ink-2); border-top: 1px dashed var(--grid); padding-top: 12px; }
+  .pipe-caption b { color: var(--ink); }
+
+  /* ---------- 5 whys ---------- */
+  .whys { margin-top: 8px; }
+  .why-step {
+    display: flex; gap: 14px; align-items: flex-start; padding: 12px 0;
+    opacity: .28; transition: opacity .3s; border-bottom: 1px dashed var(--grid);
+  }
+  .why-step.lit { opacity: 1; }
+  .why-num {
+    flex: 0 0 34px; height: 34px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    font-weight: 800; font-size: 14px; background: var(--blue-wash); color: var(--ink);
+  }
+  .why-step.lit .why-num { background: var(--series-2); color: #fff; }
+  .why-q { font-weight: 700; font-size: 14.5px; }
+  .why-a { font-size: 14px; color: var(--ink-2); }
+  .why-final {
+    margin-top: 16px; display: none; padding: 14px 16px; border-radius: 12px;
+    background: color-mix(in srgb, var(--series-2) 9%, var(--surface-1));
+    border: 1px solid color-mix(in srgb, var(--series-2) 35%, transparent);
+    font-size: 14.5px;
+  }
+  .why-final.show { display: block; animation: fadein .3s ease; }
+
+  /* ---------- metric mapping ---------- */
+  .map-layout { display: grid; grid-template-columns: 300px 1fr; gap: 18px; }
+  @media (max-width: 820px) { .map-layout { grid-template-columns: 1fr; } }
+  .map-list { display: flex; flex-direction: column; gap: 8px; }
+  .map-item {
+    text-align: left; font-family: inherit; cursor: pointer;
+    border: 1px solid var(--border); border-radius: 12px; background: var(--surface-1);
+    padding: 12px 14px; transition: border-color .15s, background .15s;
+  }
+  .map-item .apm { font-size: 11.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--series-1); font-weight: 700; }
+  .map-item .dob { font-size: 15px; font-weight: 700; color: var(--ink); margin-top: 2px; }
+  .map-item:hover { border-color: var(--blue-mid); }
+  .map-item.sel { border-color: var(--series-2); background: color-mix(in srgb, var(--series-2) 6%, var(--surface-1)); }
+  .map-detail { min-height: 320px; }
+  .map-detail .pair { display: flex; flex-wrap: wrap; gap: 10px; align-items: baseline; margin-bottom: 4px; }
+  .map-detail .pair .from { color: var(--series-1); font-weight: 700; font-size: 14px; }
+  .map-detail .pair .to   { color: var(--series-2); font-weight: 800; font-size: 19px; }
+  .map-detail .q { font-style: italic; color: var(--ink-2); font-size: 14.5px; margin-bottom: 14px; }
+  .map-detail h4 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 14px 0 6px; }
+  .map-detail p { font-size: 14.5px; color: var(--ink-2); }
+  .map-detail p b, .map-detail li b { color: var(--ink); }
+  .metric-chip {
+    display: inline-block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+    background: color-mix(in srgb, var(--series-1) 9%, var(--surface-1));
+    border: 1px solid color-mix(in srgb, var(--series-1) 30%, transparent);
+    border-radius: 8px; padding: 3px 9px; margin: 3px 4px 3px 0; color: var(--ink);
+  }
+
+  /* ---------- breaks accordion ---------- */
+  .break-card { border: 1px solid var(--border); border-radius: 14px; background: var(--surface-1); margin-bottom: 12px; overflow: hidden; }
+  .break-head {
+    width: 100%; text-align: left; font-family: inherit; cursor: pointer; border: none; background: transparent;
+    display: flex; align-items: center; gap: 14px; padding: 16px 18px;
+  }
+  .break-head .n {
+    flex: 0 0 36px; height: 36px; border-radius: 10px; display: flex; align-items: center; justify-content: center;
+    font-weight: 800; color: #fff; font-size: 15px;
+  }
+  .break-head .t { font-size: 16px; font-weight: 700; color: var(--ink); }
+  .break-head .s { font-size: 13px; color: var(--ink-2); }
+  .break-head .chev { margin-left: auto; color: var(--muted); transition: transform .2s; font-size: 14px; }
+  .break-card.open .chev { transform: rotate(90deg); }
+  .break-body { display: none; padding: 0 18px 18px 68px; font-size: 14.5px; color: var(--ink-2); }
+  .break-card.open .break-body { display: block; animation: fadein .25s ease; }
+  .break-body b { color: var(--ink); }
+  .break-body .kpi-line {
+    margin-top: 12px; padding: 10px 14px; border-radius: 10px; font-size: 13.5px;
+    background: color-mix(in srgb, var(--series-7) 8%, var(--surface-1));
+    border: 1px solid color-mix(in srgb, var(--series-7) 30%, transparent);
+  }
+  @media (max-width: 640px) { .break-body { padding-left: 18px; } }
+
+  /* ---------- scorecard tiles ---------- */
+  .tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  @media (max-width: 860px) { .tiles { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 560px) { .tiles { grid-template-columns: 1fr; } }
+  .tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
+  .tile .cat { font-size: 11.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 700; }
+  .tile .val { font-size: 30px; font-weight: 800; letter-spacing: -0.02em; margin: 6px 0 2px; color: var(--ink); }
+  .tile .val .unit { font-size: 15px; font-weight: 600; color: var(--ink-2); }
+  .tile .desc { font-size: 13px; color: var(--ink-2); }
+  .tile .base { font-size: 12px; color: var(--muted); margin-top: 8px; border-top: 1px dashed var(--grid); padding-top: 8px; }
+  .tile .base b { color: var(--good-text); font-weight: 700; }
+
+  /* ---------- inaction ---------- */
+  .compare2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .compare2 { grid-template-columns: 1fr; } }
+  .compare2 .card h3 { margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .compare2 p { font-size: 14.5px; color: var(--ink-2); }
+  .compare2 p b { color: var(--ink); }
+  .callout {
+    margin-top: 18px; padding: 16px 18px; border-radius: 12px; font-size: 14.5px; color: var(--ink-2);
+    background: color-mix(in srgb, var(--warning) 12%, var(--surface-1));
+    border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+  }
+  .callout b { color: var(--ink); }
+
+  footer { padding: 30px 0 50px; color: var(--muted); font-size: 12.5px; border-top: 1px solid var(--grid); }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <a href="#problem">Problem statement</a>
+    <a href="#demo">Silent failure</a>
+    <a href="#mapping">Metric mapping</a>
+    <a href="#breaks">Where it breaks</a>
+    <a href="#scorecard">Scorecard</a>
+    <a href="#inaction">Cost of inaction</a>
+    <button class="theme-btn" id="themeBtn" aria-label="Toggle dark mode">◐ Theme</button>
+  </div>
+</nav>
+
+<header class="wrap">
+  <div class="kicker">Signal Factory · Leadership Briefing</div>
+  <h1>Data Observability: the New Relic analogy — and where it breaks</h1>
+  <p class="lede">New Relic answers <strong>“is my service healthy?”</strong> Data observability answers <strong>“is my data healthy?”</strong> Those are different questions, because <strong>a service can be 100% healthy while producing 100% wrong data.</strong> Every batch job that exits with code 0 while silently dropping half its rows shows green in New Relic.</p>
+</header>
+
+<!-- ================= PROBLEM STATEMENT ================= -->
+<section id="problem">
+  <div class="wrap">
+    <h2>The problem statement</h2>
+    <p class="section-sub">The hidden assumption behind the analogy: <em>“if the pipelines are running, the data is fine.”</em> That assumption is false. Toggle the two lenses to see how the question — and the failure mode — changes.</p>
+
+    <div class="lens-toggle" role="tablist">
+      <button id="btnApm" class="active-apm" onclick="setLens('apm')">APM lens (New Relic)</button>
+      <button id="btnData" onclick="setLens('data')">Data lens (Signal Factory)</button>
+    </div>
+
+    <div id="panelApm" class="lens-panel show">
+      <div class="ps-grid">
+        <div class="ps-cell"><div class="label">The question</div><p><b>“My code is executing — is it executing correctly?”</b> Fast, error-free, available.</p></div>
+        <div class="ps-cell"><div class="label">The failure mode</div><p><b>Visible and self-announcing.</b> 500s, latency spikes, crashes. The failing thing emits the signal itself.</p></div>
+        <div class="ps-cell"><div class="label">First detector</div><p><b>The monitoring system</b> — within seconds. Users see an error and retry.</p></div>
+        <div class="ps-cell"><div class="label">Unit of damage</div><p><b>A failed request.</b> Bounded, retryable, visible in the error budget.</p></div>
+      </div>
+    </div>
+
+    <div id="panelData" class="lens-panel">
+      <div class="ps-grid">
+        <div class="ps-cell"><div class="label">The question</div><p><b>“My jobs all succeeded — is the data they produced actually trustworthy?”</b> Fresh, complete, valid, contract-compliant.</p></div>
+        <div class="ps-cell"><div class="label">The failure mode</div><p><b>Silent.</b> The job succeeds, the dashboard renders, the model scores — but the numbers are wrong, stale, or incomplete. Nothing throws.</p></div>
+        <div class="ps-cell"><div class="label">First detector</div><p><b>A human downstream</b> — an analyst, a customer, a regulator — often hours or days later. MTTR today exceeds <b>4+ hours</b> of manually tracing DAGs and logs.</p></div>
+        <div class="ps-cell"><div class="label">Unit of damage</div><p><b>A wrong decision.</b> Made confidently, on bad numbers, in the window before anyone noticed. Not retryable.</p></div>
+      </div>
+    </div>
+
+    <div class="quote">Today, data engineers spend <b>&gt;30% of their time</b> debugging stale or incorrect outputs, and the first alarm for bad data is usually <b>a person, not a system</b>.</div>
+  </div>
+</section>
+
+<!-- ================= SILENT FAILURE DEMO ================= -->
+<section id="demo">
+  <div class="wrap">
+    <h2>The same incident, two lenses</h2>
+    <p class="section-sub">A real pattern: after a routine deploy, an upstream producer starts passing <b>null</b> in a field the risk model depends on. Every job “succeeds,” volume looks normal, latency is great. Switch lenses to see why APM misses it — then walk the 5 Whys.</p>
+
+    <div class="card">
+      <div class="pipe-controls">
+        <button class="pill-btn on-infra" id="pbInfra" onclick="setPipe('infra')">What New Relic sees</button>
+        <button class="pill-btn" id="pbData" onclick="setPipe('data')">What the data says</button>
+      </div>
+
+      <div class="pipeline" id="pipeline" aria-live="polite"></div>
+      <div class="pipe-caption" id="pipeCaption"></div>
+    </div>
+
+    <div class="card" style="margin-top:16px;">
+      <h3 style="margin-bottom:4px;">Walk the 5 Whys</h3>
+      <p style="font-size:13.5px; color:var(--ink-2); margin-bottom:6px;">Each “why” is a hop no APM tool can make — because none of them is about compute.</p>
+      <div class="whys" id="whys"></div>
+      <div style="margin-top:14px; display:flex; gap:10px;">
+        <button class="pill-btn" id="whyBtn" onclick="nextWhy()">Reveal Why #1 →</button>
+        <button class="pill-btn" onclick="resetWhys()">Reset</button>
+      </div>
+      <div class="why-final" id="whyFinal">
+        <b>Root cause of the root cause:</b> nothing in the stack was measuring <b>the data itself</b> — only the compute. New Relic would have caught <b>none of the five</b>. That gap is the platform.
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= METRIC MAPPING ================= -->
+<section id="mapping">
+  <div class="wrap">
+    <h2>The metric mapping</h2>
+    <p class="section-sub">APM has golden signals: latency, traffic, errors, saturation. Data has five pillars: <b>freshness, volume, quality, schema/contracts, lineage</b>. Click any row to see the translation, a concrete example, and the metric with its threshold.</p>
+
+    <div class="map-layout">
+      <div class="map-list" id="mapList" role="tablist"></div>
+      <div class="card map-detail" id="mapDetail" role="tabpanel" aria-live="polite"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= WHERE IT BREAKS ================= -->
+<section id="breaks">
+  <div class="wrap">
+    <h2>Where the analogy breaks — and why that’s the pitch</h2>
+    <p class="section-sub">Three breaks matter. Each one maps to a platform capability leadership is funding. Click to expand.</p>
+
+    <div class="break-card open" id="bc1">
+      <button class="break-head" onclick="toggleBreak('bc1')" aria-expanded="true">
+        <span class="n" style="background:var(--series-1);">1</span>
+        <span><span class="t">APM detects. We prevent.</span><br><span class="s">Impact analysis at build control — before the change merges</span></span>
+        <span class="chev">▶</span>
+      </button>
+      <div class="break-body">
+        <p>New Relic tells you the deploy broke prod <b>after</b> it broke prod. Because we hold the <b>lineage graph</b>, we can run impact analysis <b>at PR time</b>: a developer changes a column type, and before merge the CI check walks the graph and reports — <i>“this breaks 14 downstream tables, 3 Tier-1 dashboards, and the fraud model.”</i></p>
+        <p style="margin-top:8px;">There is no APM equivalent, because services don’t know their consumers the way a lineage graph does. This is the build-control gate: the cheapest incident is the one that never ships.</p>
+        <div class="kpi-line">📐 <b>Metrics:</b> % of breaking changes caught pre-merge · incidents prevented per quarter · CI impact-check latency (&lt; 2 min added to the PR pipeline)</div>
+      </div>
+    </div>
+
+    <div class="break-card" id="bc2">
+      <button class="break-head" onclick="toggleBreak('bc2')" aria-expanded="false">
+        <span class="n" style="background:var(--series-2);">2</span>
+        <span><span class="t">APM’s blast radius is a page. Ours is a decision.</span><br><span class="s">Async evidence &amp; circuit breaking — quarantine + Certified View</span></span>
+        <span class="chev">▶</span>
+      </button>
+      <div class="break-body">
+        <p>When a service is down, users see an error and retry. When data is bad, <b>nobody sees an error</b> — the CFO sees a wrong number and acts on it. So the platform collects evidence <b>asynchronously, out-of-band</b> (never blocking the pipeline) and trips a <b>circuit breaker on the data path</b>: failing data diverts to <b>quarantine</b>, while the <b>Certified View</b> pins every consumer to the last-known-good version.</p>
+        <p style="margin-top:8px;">The APM analogy is a circuit breaker in a service mesh — but ours protects <b>decisions, not requests</b>.</p>
+        <div class="kpi-line">📐 <b>Metrics:</b> incidents where bad data reached a Tier-1 consumer (target → 0) · minutes bad data was live in a certified surface · quarantine catch rate</div>
+      </div>
+    </div>
+
+    <div class="break-card" id="bc3">
+      <button class="break-head" onclick="toggleBreak('bc3')" aria-expanded="false">
+        <span class="n" style="background:var(--series-7);">3</span>
+        <span><span class="t">RCA in APM is a stack trace. In data, it’s a graph traversal.</span><br><span class="s">RCA Copilot over the lineage graph + evidence timeline</span></span>
+        <span class="chev">▶</span>
+      </button>
+      <div class="break-body">
+        <p>A stale Gold table has no stack trace — the root cause is <b>four hops upstream, in another team’s domain</b>. RCA Copilot traverses the lineage graph plus the evidence timeline and answers deterministically: <i>“Gold is stale because Silver volume dropped 50% at 02:14, because upstream producer X deployed schema change Y.”</i></p>
+        <p style="margin-top:8px;">This is what turns a 4-hour manual trace through Airflow DAGs and Spark logs into a 2-minute explanation.</p>
+        <div class="kpi-line">📐 <b>Metrics:</b> MTTD &lt; 15 min after expected completion · 70%+ of incidents auto-explained in &lt; 2 min · MTTR from 4+ hours → minutes</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= SCORECARD ================= -->
+<section id="scorecard">
+  <div class="wrap">
+    <h2>The platform scorecard</h2>
+    <p class="section-sub">What leadership should hold the platform to — the same discipline as APM SLOs, in data currency.</p>
+
+    <div class="tiles">
+      <div class="tile">
+        <div class="cat">Detection</div>
+        <div class="val">&lt; 15 <span class="unit">min MTTD</span></div>
+        <div class="desc">Failure detected within minutes of the expected completion window.</div>
+        <div class="base">Today: hours → days · <b>silent until a human notices</b></div>
+      </div>
+      <div class="tile">
+        <div class="cat">Resolution</div>
+        <div class="val">70%<span class="unit"> auto-explained &lt; 2 min</span></div>
+        <div class="desc">RCA Copilot explains the incident from the lineage + evidence graph.</div>
+        <div class="base">Today: MTTR <b>4+ hours</b> of manual tracing</div>
+      </div>
+      <div class="tile">
+        <div class="cat">Prevention</div>
+        <div class="val">PR-time<span class="unit"> impact gate</span></div>
+        <div class="desc">Breaking changes blocked before merge; incidents-prevented counted per quarter.</div>
+        <div class="base">Today: <b>zero</b> pre-change visibility</div>
+      </div>
+      <div class="tile">
+        <div class="cat">Coverage</div>
+        <div class="val">80%<span class="unit"> repos / 60 days</span></div>
+        <div class="desc">Autopilot push model instruments repos with zero producer friction.</div>
+        <div class="base">Plus <b>95%+</b> of Tier-1 jobs emitting contract evidence</div>
+      </div>
+      <div class="tile">
+        <div class="cat">Trust</div>
+        <div class="val">Data<span class="unit"> downtime → 0</span></div>
+        <div class="desc">Minutes that bad or stale data was consumable from a certified surface. This is the “nines” of data.</div>
+        <div class="base">Today: <b>unmeasured</b> — and therefore unmanaged</div>
+      </div>
+      <div class="tile">
+        <div class="cat">Engineering drag</div>
+        <div class="val">&lt; 10%<span class="unit"> time on data debugging</span></div>
+        <div class="desc">Reclaim engineering capacity currently burned on manual triage.</div>
+        <div class="base">Today: <b>&gt;30%</b> of data-engineering time</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= COST OF INACTION ================= -->
+<section id="inaction">
+  <div class="wrap">
+    <h2>Cost of inaction — in the currency leadership already understands</h2>
+
+    <div class="compare2">
+      <div class="card">
+        <h3><span class="dot" style="background:var(--series-1);"></span>Why you bought New Relic</h3>
+        <p>Unmonitored services cost you <b>outages measured in minutes of downtime</b>. The damage is visible, bounded, and stops when the service recovers.</p>
+      </div>
+      <div class="card">
+        <h3><span class="dot" style="background:var(--series-2);"></span>What unmonitored data costs</h3>
+        <p>Wrong decisions measured in <b>days of undetected wrongness</b>: &gt;30% of engineering time on debugging, plus every decision made on bad numbers in the window before a human noticed. The damage compounds silently and doesn’t stop when the job “recovers.”</p>
+      </div>
+    </div>
+
+    <div class="callout">
+      ⚠️ <b>Set expectations for the first 30 days:</b> the metrics will look <b>worse</b>, not better. The platform will surface freshness and quality violations that were always there but invisible. Expect a period of <i>“the platform is showing us how bad things actually are”</i> before it becomes <i>“the platform is helping us get better faster.”</i> That’s the platform working.
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    Sources: batch_observability_prd.md · Data_Observability_Roadmap_Detailed.docx · adversarial_challenge_response.md · Autopilot Push Model · Data_Observability_LLD_Component_Decomposition.docx — project “data observability — new”.
+  </div>
+</footer>
+
+<script>
+/* ---------- theme toggle ---------- */
+document.getElementById('themeBtn').addEventListener('click', function () {
+  var r = document.documentElement;
+  var cur = r.getAttribute('data-theme');
+  if (cur === 'dark') { r.setAttribute('data-theme', 'light'); }
+  else if (cur === 'light') { r.setAttribute('data-theme', 'dark'); }
+  else {
+    var osDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    r.setAttribute('data-theme', osDark ? 'light' : 'dark');
+  }
+});
+
+/* ---------- problem-statement lens ---------- */
+function setLens(which) {
+  var apm = which === 'apm';
+  document.getElementById('panelApm').classList.toggle('show', apm);
+  document.getElementById('panelData').classList.toggle('show', !apm);
+  document.getElementById('btnApm').className = apm ? 'active-apm' : '';
+  document.getElementById('btnData').className = apm ? '' : 'active-data';
+}
+
+/* ---------- pipeline demo ---------- */
+var NODES = [
+  { nm: 'Upstream producer', role: 'routine deploy shipped',
+    infra: { st: 'ok', txt: 'Healthy', d: 'CPU normal · 0 errors · deploy succeeded' },
+    data:  { st: 'warn', txt: 'Null spike', d: 'credit_utilization null rate: 0% → 98% after deploy' } },
+  { nm: 'Ingest job', role: 'Spark · exit code 0',
+    infra: { st: 'ok', txt: 'Succeeded', d: 'Job on schedule · volume normal · no exceptions' },
+    data:  { st: 'bad', txt: 'DQ breach', d: 'null_rate on critical column breaches 0.5% SLO — nulls are schema-valid, so nothing throws' } },
+  { nm: 'Feature table', role: 'feature engineering',
+    infra: { st: 'ok', txt: 'Written', d: 'Partition committed · row counts normal' },
+    data:  { st: 'bad', txt: 'Silent imputation', d: 'Pipeline fills nulls with default 0 — feature distribution collapses' } },
+  { nm: 'Risk model scoring', role: 'batch inference',
+    infra: { st: 'ok', txt: 'Scored fine', d: 'Inference latency great · 0 errors · DAG green' },
+    data:  { st: 'bad', txt: 'Feature drift', d: 'Model sees "0% utilization" for everyone — scores skew optimistic' } },
+  { nm: 'Credit decisions', role: 'what the business acts on',
+    infra: { st: 'ok', txt: 'Renders fine', d: '200 OK · approvals flowing normally' },
+    data:  { st: 'bad', txt: 'Wrong approvals', d: 'High-risk applicants approved — confidently wrong, no error anywhere' } }
+];
+
+function setPipe(mode) {
+  var infra = mode === 'infra';
+  document.getElementById('pbInfra').className = 'pill-btn' + (infra ? ' on-infra' : '');
+  document.getElementById('pbData').className = 'pill-btn' + (infra ? '' : ' on-data');
+  var host = document.getElementById('pipeline');
+  var html = '';
+  NODES.forEach(function (n, i) {
+    var s = infra ? n.infra : n.data;
+    var icon = s.st === 'ok' ? '✓' : (s.st === 'warn' ? '△' : '✕');
+    var lbl = s.st === 'ok' ? 'OK' : (s.st === 'warn' ? 'Warning' : 'Breach');
+    html += '<div class="node"><div class="box" style="border-color:' +
+      (s.st === 'ok' ? 'var(--good)' : s.st === 'warn' ? 'var(--warning)' : 'var(--critical)') + ';">' +
+      '<div class="nm">' + n.nm + '</div><div class="role">' + n.role + '</div>' +
+      '<span class="st ' + s.st + '">' + icon + ' ' + s.txt + '</span>' +
+      '<div class="detail">' + s.d + '</div></div></div>';
+    if (i < NODES.length - 1) html += '<div class="arrow">→</div>';
+  });
+  host.innerHTML = html;
+  document.getElementById('pipeCaption').innerHTML = infra
+    ? '<b>Everything is green.</b> Five healthy components, zero alerts, error budget untouched — even <b>volume and freshness are normal</b>, because nulls flow through at full speed. New Relic has nothing to page about, and the model is quietly approving the wrong people.'
+    : '<b>Same moment, data lens:</b> a null-rate spike at the source, a DQ breach on a critical column, silent imputation collapsing the feature distribution, drift at the model input, and decisions that are confidently wrong. This is the nastiest class of silent failure — <b>no volume drop, no staleness, nothing “missing”</b> — only quality and distribution signals catch it. Evidence at each boundary surfaces it in minutes, and the circuit breaker holds the model on the last certified feature snapshot instead of scoring on garbage.';
+}
+
+/* ---------- 5 whys ---------- */
+var WHYS = [
+  { q: 'Why are the model’s risk scores wrong?', a: 'A key feature — credit_utilization — reached the model as a default value (0) for 98% of records.' },
+  { q: 'Why was the feature defaulted?', a: 'The feature pipeline silently imputed nulls to 0, and the field was suddenly null almost everywhere.' },
+  { q: 'Why was the field null?', a: 'An upstream deploy refactored the payload and stopped populating it. The producer team never knew a model consumed that field.' },
+  { q: 'Why did every pipeline accept it?', a: 'The field is nullable in the schema, so every record was “valid.” No contract said null_rate < 1% on this column — schema checks pass, semantics fail.' },
+  { q: 'Why did nobody know for two weeks?', a: 'Jobs green, volume normal, latency great, dashboards rendering. Nothing measured the data itself — the null spike, the distribution collapse, the feature drift.' }
+];
+var whyIdx = 0;
+function renderWhys() {
+  var host = document.getElementById('whys');
+  var html = '';
+  WHYS.forEach(function (w, i) {
+    html += '<div class="why-step' + (i < whyIdx ? ' lit' : '') + '"><div class="why-num">' + (i + 1) + '</div>' +
+      '<div><div class="why-q">' + w.q + '</div>' + (i < whyIdx ? '<div class="why-a">' + w.a + '</div>' : '') + '</div></div>';
+  });
+  host.innerHTML = html;
+  var btn = document.getElementById('whyBtn');
+  if (whyIdx >= WHYS.length) { btn.textContent = 'All five revealed'; btn.disabled = true; btn.style.opacity = .5; }
+  else { btn.textContent = 'Reveal Why #' + (whyIdx + 1) + ' →'; btn.disabled = false; btn.style.opacity = 1; }
+  document.getElementById('whyFinal').classList.toggle('show', whyIdx >= WHYS.length);
+}
+function nextWhy() { if (whyIdx < WHYS.length) { whyIdx++; renderWhys(); } }
+function resetWhys() { whyIdx = 0; renderWhys(); }
+
+/* ---------- metric mapping ---------- */
+var MAPPINGS = [
+  { apm: 'Uptime / availability', dob: 'Freshness',
+    q: 'Did the data arrive when it was expected?',
+    why: 'A service is “up” continuously; a dataset is “up” when its latest expected slice has landed. Batch freshness is watermark-based (which partition is confirmed committed); streaming freshness is latency-based (event-time lag).',
+    ex: '<b>Batch:</b> <code>orders_gold</code> is expected by 06:00. At 06:15 the watermark still shows yesterday’s partition → FRESHNESS_BREACH raised within minutes — not when an analyst notices at 10 AM. <b>Streaming:</b> event-time lag exceeds 5 minutes → freshness signal fires.',
+    metrics: ['watermark_lag (partitions behind expected)', 'event_time_lag p95 < 5 min', 'sla_miss_count by dataset tier', 'expected_by deadline per dataset'] },
+  { apm: 'Throughput (requests/min)', dob: 'Volume',
+    q: 'Did the expected amount of data arrive?',
+    why: 'Traffic tells you demand is normal; volume tells you the pipeline actually carried what it should. Volume anomalies are leading indicators of upstream failures — a drop shows up before the wrong number does.',
+    ex: 'Rolling 7-day baseline says 10K events/hour. Current hour shows 5K → VOLUME_DROP signal. Investigation reveals an upstream producer deployment paused publishing. Without a baseline, a 50% row-count drop is invisible because the job “succeeded.”',
+    metrics: ['row_count vs 7-day rolling baseline (±30% band)', 'events_per_hour_min threshold (e.g. ≥ 1,000)', 'partition_size_distribution drift', 'null-partition detection'] },
+  { apm: 'Error rate', dob: 'Quality / validity rate',
+    q: 'What fraction of the records are bad?',
+    why: 'An app error throws and gets counted. A bad record doesn’t throw — it flows. Quality metrics count the records that are wrong even though everything “worked”: nulls, duplicates, out-of-range values, distribution drift.',
+    ex: 'Null rate on <code>customer_id</code> crosses 0.5% of records → DQ breach evidence emitted. A duplicate-key spike after a backfill, or an amount field suddenly 100× (currency unit bug), trips distribution checks the same way an error-rate spike pages an SRE.',
+    metrics: ['null_rate per critical column < 0.5%', 'duplicate_rate on primary keys', 'range/enum violation count', 'distribution drift score vs baseline'] },
+  { apm: 'API spec + SLO', dob: 'Schema & contract compliance',
+    q: 'Does the data conform to what producer and consumer agreed?',
+    why: 'Services have typed APIs enforced at compile time; data crosses team boundaries with no compiler. The contract is the API of data — schema fingerprint, required fields, business rules — and compliance rate is its SLO.',
+    ex: 'In one window: 1,247 evidence events, 1,120 FAIL with reason <code>MISSING_FIELD:customer_id</code>. Compliance = 10.2% vs a 95% SLO → CONTRACT_BREACH incident opened automatically, attributed to the producing service via schema fingerprint.',
+    metrics: ['contract_compliance_rate ≥ 95% (Tier-1)', 'schema_drift_detected count', 'failure_signature dedup (e.g. MISSING_FIELD:x)', 'evidence PASS/FAIL ratio per dataset'] },
+  { apm: 'Distributed tracing / service map', dob: 'Lineage',
+    q: 'Who produces this data, and who consumes it — down to the column?',
+    why: 'The service map shows request flow between services. Lineage shows dependency flow between jobs, tables, and columns — and unlike a trace, it can be walked <i>before</i> a change ships (impact analysis) and <i>after</i> an incident (root cause).',
+    ex: 'Element-level lineage in the graph answers: “<code>orders.customer_id</code> feeds 14 downstream tables, 3 Tier-1 dashboards, and the fraud model.” That single query powers both the PR-time impact gate and the RCA traversal.',
+    metrics: ['lineage coverage % of Tier-1 assets', 'column-level edge completeness', 'blast_radius size per proposed change', 'graph query latency for impact checks'] },
+  { apm: 'Latency (p95 / p99)', dob: 'Pipeline latency / staleness distribution',
+    q: 'How long from source event to consumable data?',
+    why: 'Request latency is milliseconds; data latency is the end-to-end journey from the event happening to the Gold table reflecting it. Its p95 is what a consumer should be told to expect — and what the SLA is written against.',
+    ex: 'SLA: source event → Gold table in ≤ 45 minutes at p95. A regression from 30 → 70 minutes is a breach even if every individual job is “fast” — the queue between them grew.',
+    metrics: ['end_to_end_latency p95 ≤ 45 min', 'per-stage latency breakdown (medallion hops)', 'staleness_at_read distribution', 'backlog/queue depth between stages'] },
+  { apm: 'Golden-signal alerting', dob: 'Evidence',
+    q: 'Is there an immutable PASS/FAIL record for every validation, at every boundary?',
+    why: 'APM alerts are derived from metrics streams. Here, the primitive is <b>Evidence</b>: an immutable PASS/FAIL record emitted at every medallion stage boundary onto the Evidence Bus, aggregated by Signal Engines into the health signals above. Evidence coverage is the platform’s own health metric — the observability of observability.',
+    ex: 'Every write to Silver emits evidence: schema check PASS, volume check PASS, contract check FAIL(reason). Signal Engines aggregate; a breach becomes an incident with the evidence trail attached — the “stack trace” for data.',
+    metrics: ['evidence_emission_coverage ≥ 95% of Tier-1 datasets', 'evidence_bus lag < 60s', 'signal engine evaluation latency', 'false_positive rate post-calibration'] }
+];
+
+var mapSel = 0;
+function renderMapList() {
+  var host = document.getElementById('mapList');
+  var html = '';
+  MAPPINGS.forEach(function (m, i) {
+    html += '<button class="map-item' + (i === mapSel ? ' sel' : '') + '" onclick="selMap(' + i + ')" role="tab" aria-selected="' + (i === mapSel) + '">' +
+      '<div class="apm">APM: ' + m.apm + '</div><div class="dob">→ ' + m.dob + '</div></button>';
+  });
+  host.innerHTML = html;
+}
+function renderMapDetail() {
+  var m = MAPPINGS[mapSel];
+  var chips = m.metrics.map(function (c) { return '<span class="metric-chip">' + c + '</span>'; }).join('');
+  document.getElementById('mapDetail').innerHTML =
+    '<div class="pair"><span class="from">' + m.apm + '</span><span style="color:var(--muted);">→</span><span class="to">' + m.dob + '</span></div>' +
+    '<div class="q">“' + m.q + '”</div>' +
+    '<h4>Why it’s the equivalent — and where it differs</h4><p>' + m.why + '</p>' +
+    '<h4>Concrete example</h4><p>' + m.ex + '</p>' +
+    '<h4>Metrics &amp; thresholds</h4><div>' + chips + '</div>';
+}
+function selMap(i) { mapSel = i; renderMapList(); renderMapDetail(); }
+
+/* ---------- breaks accordion ---------- */
+function toggleBreak(id) {
+  var el = document.getElementById(id);
+  var open = el.classList.toggle('open');
+  el.querySelector('.break-head').setAttribute('aria-expanded', open);
+}
+
+/* ---------- init ---------- */
+setPipe('infra');
+renderWhys();
+renderMapList();
+renderMapDetail();
+</script>
+</body>
+</html>

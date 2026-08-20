@@ -446,8 +446,16 @@ Specs are treated as append-only; later specs supersede earlier ones **by ref ti
 * `(Producer)-[:WRITES]->(Dataset)`  
 * `(Producer)-[:READS_COL]->(Column)` *(if provided)*  
 * `(Producer)-[:WRITES_COL]->(Column)` *(if provided)*
+* `(Column)-[:DERIVED_FROM {confidence, expression}]->(Column)` *(transform mapping; Stage 4, FR-CORE-005)*
+* `(Column)-[:ALERT_BINDING {severity, events[]}]->(Column)` *(proposed — determination pending; see note)*
 
 **No per-run edges**. No evidence events in Neptune.
+
+> **ALERT\_BINDING edge (proposed — determination pending).** This edge type connects an upstream column to a downstream column where a schema change in the upstream field must trigger an alert, even when lineage confidence is LOW. It decouples the question "is there risk here?" from "can we prove the exact derivation?". Example:
+>
+> `(customer-service:riskScore) -[:ALERT_BINDING {severity: "TIER_1", events: ["TYPE_CHANGED","REMOVED"]}]-> (orders.created:order_status)`
+>
+> Populated from ODCS contract `enforcement_bindings` declarations (Option F/I in sca\_lineage\_requirements\_specification.md Section 1.4.3), not from static code analysis. Not live until the service lineage approach is determined.
 
 ---
 

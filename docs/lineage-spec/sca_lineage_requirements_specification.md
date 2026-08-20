@@ -1,8 +1,8 @@
 # SCA Element-Level Lineage Extraction: Requirements Specification
 
-**Version:** 1.0  
-**Date:** February 11, 2026  
-**Status:** Draft for Review  
+**Version:** 1.1  
+**Date:** 2026-04-02  
+**Status:** Draft for Review — Service Lineage Approach Under Consideration  
 **Owner:** Data Platform Architecture Team
 
 ---
@@ -76,6 +76,24 @@ This specification defines the functional and non-functional requirements for an
 
 ---
 
+## Stage Gate Table
+
+Functional requirements unlock when the Signal Factory platform reaches the stage that can consume them. Ingesting lineage before its consumer component is live produces dead graph edges with no RCA value.
+
+> [!NOTE]
+> Stage numbers follow the Signal Factory greenlight design scheme (Stage 0–4), not the PRD Phase 1–4 scheme. See `docs/roadmap/signal_factory_greenlight_design.md` for the full mapping.
+
+| Req Group | Capability | Stage Gate | Priority | Consumer | Rationale |
+|-----------|-----------|-----------|----------|----------|-----------|
+| FR-CORE-001 | Dataset-level lineage | Stage 2 | **P0** | C-08 Lineage Ingestor; blast-radius PR notification | Minimum viable for blast-radius notification: which jobs/models are affected by this schema change |
+| FR-CORE-002 | Attribute-level lineage (batch/Spark) | Stage 3 | **P1** | C-09 RCA Copilot | Column-level precision consumed only at Stage 3; blast-radius at Stage 2 is dataset-level |
+| FR-CORE-005 | Transform mapping | Stage 4 | **P2** | C-09 RCA Copilot (precision mode) | Input→output derivation needed for deterministic replay; not on critical path until Stage 4 |
+| FR-SVC-* | Service element lineage | **TBD** | **TBD** | C-09 RCA Copilot | Approach not yet selected; options under evaluation. See Section 1.4.3 |
+
+**Binary unlock trigger for FR-CORE-002 (P1 → active):** C-09 RCA Copilot is deployed and processing at least one Tier-1 incident query. Before that event, column edges in Neptune have no consumer and the 30% coverage gap creates graph inconsistency without benefit.
+
+---
+
 # Section 1: Functional Requirements
 
 ## 1.1 Core Lineage Extraction
@@ -83,10 +101,10 @@ This specification defines the functional and non-functional requirements for an
 | ID | Requirement | Description | Acceptance Criteria | Priority | Rationale |
 |----|-------------|-------------|---------------------|----------|-----------|
 | **FR-CORE-001** | Dataset-Level Lineage | Extract input and output datasets for each code flow | Every flow has ≥1 input OR ≥1 output dataset identified with valid URN | P0 | Minimum viable lineage for RCA blast radius |
-| **FR-CORE-002** | Attribute-Level Lineage | Extract column/field references for inputs and outputs | ≥70% of columns identified for HIGH confidence flows | P0 | Enables column-level impact analysis |
+| **FR-CORE-002** | Attribute-Level Lineage | Extract column/field references for inputs and outputs | ≥70% of columns identified for HIGH confidence flows | **P1 — Stage 3 gate** (see Stage Gate Table) | Enables column-level impact analysis; consumed by RCA Copilot (C-09), not by blast-radius notification |
 | **FR-CORE-003** | Dataset URN Resolution | Map raw table/topic references to canonical Dataset URNs | 100% of known datasets mapped to `urn:dp:<domain>:<dataset>:v<major>` format | P0 | Consistent identity for graph joins |
 | **FR-CORE-004** | Column URN Generation | Generate stable column URNs for each identified attribute | Column URNs follow `urn:col:<dataset_urn>:<column_name>` format | P0 | Enables column-level graph edges |
-| **FR-CORE-005** | Transform Mapping | Capture input→output column relationships where determinable | Transform hints include `output_column` ← `input_columns[]` for ≥50% of derivations | P1 | Enables "which input caused this output issue" analysis |
+| **FR-CORE-005** | Transform Mapping | Capture input→output column relationships where determinable | Transform hints include `output_column` ← `input_columns[]` for ≥50% of derivations | **P2 — Stage 4 gate** (see Stage Gate Table) | Enables "which input caused this output issue" analysis; not consumed until Stage 4 deterministic RCA replay |
 | **FR-CORE-006** | LineageSpec Generation | Produce compliant LineageSpec JSON for each analysis | Output validates against LineageSpec v1.0 JSON schema | P0 | Contract compliance with Lineage Ingestor |
 | **FR-CORE-007** | Idempotent Spec IDs | Generate deterministic `lineage_spec_id` for deduplication | Same repo + commit + flow → identical `lineage_spec_id` across retries | P0 | Prevents duplicate Neptune edges |
 | **FR-CORE-008** | Multi-Flow Detection | Identify multiple distinct code flows within a single repository | Each logical data path (source→sink) identified as separate flow | P0 | Precise blast radius per flow, not per repo |
@@ -181,16 +199,19 @@ This specification defines the functional and non-functional requirements for an
 
 ### 1.4.1 Microservices (Spring, Go, Node.js)
 
+> [!IMPORTANT]
+> **Priority status: Under Review.** The requirements in this section (FR-SVC-001 through FR-SVC-008) were originally marked P0/P1 based on the assumption that static code analysis can reliably trace column lineage through service business logic. Adversarial review of this assumption has revealed a ~40–50% coverage ceiling for services performing interprocedural business logic decisions (see Section 1.4.3). All FR-SVC-* priorities are suspended pending approach selection. Do not implement against these requirements until a determination is made.
+
 | ID | Requirement | Description | Acceptance Criteria | Priority | Rationale |
 |----|-------------|-------------|---------------------|----------|-----------|
-| **FR-SVC-001** | API Endpoint Detection | Identify REST/GraphQL endpoints as flow entry points | Each endpoint with data output = potential flow | P0 | Services expose multiple endpoints |
-| **FR-SVC-002** | Request/Response Schema | Extract column lineage from request→response transformation | Request body fields → response body fields traced | P1 | Core service transformation |
-| **FR-SVC-003** | Kafka Producer Tracing | Trace columns from API request to Kafka message | HTTP payload fields → Kafka event fields mapped | P0 | Common integration pattern |
-| **FR-SVC-004** | ORM Mapping Extraction | Extract column mappings from JPA/GORM/Prisma | Database columns ↔ entity fields ↔ API fields traced | P1 | ORM defines column relationships |
-| **FR-SVC-005** | GraphQL Field Selection | Handle dynamic field selection in GraphQL | All possible fields captured; mark MEDIUM confidence (runtime varies) | P2 | GraphQL fields are client-selected |
-| **FR-SVC-006** | Event Sourcing Support | Trace columns through event/aggregate patterns | Command → Event → Aggregate state field mappings | P2 | Event sourcing has indirect lineage |
-| **FR-SVC-007** | Multi-Language Support | Support Java (Spring), Go, Node.js, Python | Framework-specific parsers for each language | P0 | Polyglot services common |
-| **FR-SVC-008** | Deployment Version Correlation | Link container image tag to commit SHA | `image:tag` → `commit_sha` mapping included or resolvable | P1 | Required for runtime correlation |
+| **FR-SVC-001** | API Endpoint Detection | Identify REST/GraphQL endpoints as flow entry points | Each endpoint with data output = potential flow | **TBD** | Services expose multiple endpoints |
+| **FR-SVC-002** | Request/Response Schema | Extract column lineage from request→response transformation | Request body fields → response body fields traced | **TBD** | Core service transformation |
+| **FR-SVC-003** | Kafka Producer Tracing | Trace columns from API request to Kafka message | HTTP payload fields → Kafka event fields mapped | **TBD** | Common integration pattern |
+| **FR-SVC-004** | ORM Mapping Extraction | Extract column mappings from JPA/GORM/Prisma | Database columns ↔ entity fields ↔ API fields traced | **TBD** | ORM defines column relationships |
+| **FR-SVC-005** | GraphQL Field Selection | Handle dynamic field selection in GraphQL | All possible fields captured; mark MEDIUM confidence (runtime varies) | **TBD** | GraphQL fields are client-selected |
+| **FR-SVC-006** | Event Sourcing Support | Trace columns through event/aggregate patterns | Command → Event → Aggregate state field mappings | **TBD** | Event sourcing has indirect lineage |
+| **FR-SVC-007** | Multi-Language Support | Support Java (Spring), Go, Node.js, Python | Framework-specific parsers for each language | **TBD** | Polyglot services common |
+| **FR-SVC-008** | Deployment Version Correlation | Link container image tag to commit SHA | `image:tag` → `commit_sha` mapping included or resolvable | **TBD** | Required for runtime correlation |
 
 ### 1.4.2 Lambda / Serverless
 
@@ -201,6 +222,97 @@ This specification defines the functional and non-functional requirements for an
 | **FR-LAMBDA-003** | Layer Dependency Tracing | Follow lineage into Lambda layers | Shared layer code analyzed; flows reference layer functions | P2 | Layers contain shared logic |
 | **FR-LAMBDA-004** | Environment Variable Handling | Resolve env-var-driven configuration | Table names, topic names from env vars resolved if determinable | P2 | Lambdas use env vars for config |
 | **FR-LAMBDA-005** | Step Function Integration | Trace lineage across Step Function states | State machine definition parsed; per-state lineage linked | P2 | Step Functions orchestrate Lambdas |
+
+---
+
+### 1.4.3 Service Element Lineage — Approach Options Under Consideration
+
+> [!IMPORTANT]
+> **Status: No determination made.** This section documents the options evaluated and their trade-offs. Priorities for FR-SVC-* in Section 1.4.1 will be updated once an approach is selected. The options below were evaluated using a concrete example: `OrderService.create_order` calling `CustomerService` via GraphQL, then writing 12 fields to `orders.created` Kafka topic.
+
+#### Problem Statement
+
+Services performing multi-step business logic (external API calls, conditional routing, threshold evaluation) cannot have their column-level field provenance reliably traced by static code analysis. A concrete example:
+
+```
+OrderService.create_order:
+  1. Reads customer_id, product_sku, quantity from request
+  2. Calls CustomerService.GetCustomerForOrder (GraphQL) → riskScore, loyaltyTier, creditLimit
+  3. Applies business rules:
+       order_status  = QUARANTINE if riskScore >= 70 else APPROVED
+       discount_rate = LOYALTY_DISCOUNT_TABLE[loyaltyTier]
+       payment_method = INVOICE if creditLimit > net_amount else CARD
+  4. Produces 12 fields to orders.created Kafka topic
+```
+
+Of the 12 output fields in `OrderCreatedEvent`, static analysis can trace with HIGH confidence: 2. The remaining 10 require decision-logic tracing that static analysis cannot reliably perform.
+
+#### Tractability Map (OrderCreatedEvent example)
+
+| Field | Tractability | Reason |
+|-------|-------------|--------|
+| `order_id` | HIGH | `generate_ulid()` — local, no upstream |
+| `customer_id` | HIGH | Direct pass-through from request |
+| `product_sku` | HIGH | Direct pass-through from request |
+| `gross_amount` | MEDIUM | Arithmetic: `unit_price * quantity` — detectable |
+| `display_currency` | MEDIUM | Conditional pass-through from upstream field |
+| `customer_segment` | MEDIUM | Bucket function over upstream field |
+| `discount_rate` | LOW | Table lookup keyed by upstream enum; table contents opaque to static analysis |
+| `net_amount` | LOW | Arithmetic of LOW-confidence inputs |
+| `net_amount_local` | LOW | FX conversion: rate source not deterministic |
+| `payment_method` | NOT TRACTABLE | Business rule: threshold comparison across two fields |
+| `order_status` | NOT TRACTABLE | Threshold on upstream `riskScore`; threshold hardcoded |
+| `requires_review` | NOT TRACTABLE | Compound condition across two upstream fields |
+
+Static analysis ceiling for this service: ~40–50% field coverage. The critical business-logic fields (order routing, payment routing, fraud flags) are exactly the ones that cannot be traced.
+
+#### Option Comparison
+
+| Option | Mechanism | Coverage ceiling | Code change required | Confidence quality | Key weakness |
+|--------|-----------|-----------------|---------------------|-------------------|-------------|
+| **A — Static code analysis (current spec)** | AST parsing, interprocedural analysis, ORM extraction | ~40–50% for service business logic | None | HIGH for schema-matching fields; NOT TRACTABLE for decision fields | Interprocedural dataflow is research-grade; coverage ceiling is structural, not an implementation gap |
+| **B — Schema-Registry-First** | Glue Schema Registry provides Kafka topic schemas; dataset-level edges only | Dataset-level only; no field provenance | None | HIGH for dataset edges | Does not address element-level ask at all; covers FR-CORE-001 but not FR-CORE-002 for services |
+| **C — OpenLineage with custom facets** | OpenLineage collector emits lineage events per job/service run | Dataset-level; column-level with facet extensions | Moderate (client SDK in each service) | HIGH for dataset; MEDIUM for columns | OpenLineage collector is an additional operational dependency; Kafka→S3 hop has no native collector; requires SDK instrumentation in every service |
+| **D — OTel distributed trace + lineage** | OpenTelemetry span attributes carry field provenance across service boundaries | Cross-service; field-level with span attributes | High (OTel SDK + custom span attributes per field write) | HIGH for traced fields | Requires OTel instrumentation in every service and across every cross-service call; fields must be explicitly added to spans at write time; operational overhead significant |
+| **E — eBPF network interception** | Kernel-level packet capture reconstructs cross-service field dependencies | Dataset-level; field-level with pattern matching on wire format | None (kernel module or eBPF program) | LOW (schema inference from wire data) | Linux-specific; kernel version dependency; field attribution degrades under encryption (mTLS); complex operationally; confidence is inherently LOW |
+| **F — ODCS contract lineage extension** | Lineage declarations added to existing ODCS contracts per Kafka topic; enforced at G4 gate | Complete for declared fields; explicitly missing for undeclared fields | None for producer; PM authors contract section | LOW-MEDIUM per field (developer-declared intent) | Requires a named contract owner per topic; accuracy depends on developer discipline; undeclared fields create known gaps, not silent gaps |
+| **G — CloudEvents lineage headers** | Kafka producer SDK emits `ce-lineage` header on every message; carries field-to-source mapping at runtime | Up to 8 fields per message (200-byte budget); partial by design | Minimal (SDK header emission) | Runtime confirmation of design-time declarations | Header is not authoritative; cardinality limit means partial coverage; value is drift detection against contract, not standalone lineage |
+| **H — LLM-assisted annotation generation** | At deploy time, LLM reads code diff, generates DRAFT lineage annotations as PR comment; developer reviews and approves; approved annotations feed ODCS contract | Complete for what LLM can identify; flags NOT TRACTABLE fields explicitly | None for producer until approval; PR review step | LOW for business-logic fields; HIGH for schema-match fields; developer approval elevates confidence | LLM accuracy degrades on deep call chains; wrong annotation approved silently creates incorrect Neptune edges; requires explicit developer confirmation workflow |
+| **I — Combination: F + G + H** | ODCS contract (durable record) + CloudEvents header (runtime confirmation) + LLM annotation (draft generation) | Complete declared coverage; explicit gaps for NOT TRACTABLE fields | None for producer code; contract authoring is a PM/deploy-time step | LOW-MEDIUM for business-logic fields; HIGH for pass-through fields; enforcement bindings capture cross-service schema break risk | LLM annotation accuracy; header cardinality; cross-service lineage is one hop only |
+
+#### Combination Option I — Evaluated with OrderService Example
+
+The three-mechanism combination was evaluated end-to-end with the OrderService example to understand what it actually delivers. Key findings:
+
+**What the combination produces:**
+- ODCS contract declares 12 output fields with upstream source URNs and confidence levels
+- `enforcement_bindings` in the contract specify which upstream field removals/type changes trigger TIER_1 alerts (e.g., `riskScore TYPE_CHANGED → alert on order_status, requires_review`)
+- CloudEvents `ce-lineage` header provides runtime confirmation that the producer is running the expected lineage contract version
+- LLM annotation generates the DRAFT contract section; developer review elevates or rejects each field's confidence claim
+
+**The Neptune edge that matters for RCA:**
+```
+(Column: customer-service:riskScore)
+  -[:ALERT_BINDING {severity: TIER_1, events: ["TYPE_CHANGED","REMOVED"]}]->
+(Column: orders.created:order_status)
+```
+
+This enables the blast-radius PR comment when Customer Service changes `riskScore` type: "This change will silently reroute all orders — order_status threshold was written for int range [0,100], not float [0.0,1.0]."
+
+**What the combination does NOT produce:**
+- High-confidence lineage for business-logic fields — confidence remains LOW for `order_status`, `payment_method`, `discount_rate`
+- Cross-service lineage beyond one hop — if Customer Service derives `riskScore` from a model, that chain is not captured
+- Automated accuracy verification — the enforcement binding is only as correct as the LLM annotation + developer review
+
+**Critical honest limitation:** The value is the enforcement bindings, not the lineage graph completeness. LOW-confidence lineage that fires a correct TIER_1 alert is more valuable than HIGH-confidence lineage that only covers `customer_id`.
+
+#### Open Questions Before Determination
+
+1. **SCA team input on FR-SVC sizing:** Has the SCA team sized FR-SVC-001 through FR-SVC-008? Their estimate of interprocedural analysis effort would confirm or refute the ~40–50% ceiling argument.
+2. **Developer annotation discipline:** Options F and H require contract authoring as a deploy-time step. What is the realistic compliance rate for developer-reviewed annotations without hard gate enforcement?
+3. **G4 gate enforcement:** Option I proposes enforcing lineage contract completeness at the G4 gate for Tier-1 topics. This is a meaningful behavior change for producers. Does this require a separate design review?
+4. **Dask Tier-1 annotation:** If Dask is running Tier-1 pipelines, a Dask-specific annotation YAML approach needs to be added as Stage 2 P0 regardless of the service lineage decision. This is not blocked by the service approach question.
+5. **RCA Copilot dependency:** Does the AI & Intelligence team (C-09 owner) need column-level service lineage before Stage 3? If yes, the stage gate assignment fails and urgency is higher than currently estimated.
 
 ---
 
@@ -721,6 +833,7 @@ HTTP/1.1 200 OK
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
 | 1.0 | 2026-02-11 | Data Platform Architecture | Initial draft |
+| 1.1 | 2026-04-02 | Data Platform Architecture | Add Stage Gate table; reclassify FR-CORE-002 P0→P1 (Stage 3 gate), FR-CORE-005 P1→P2 (Stage 4 gate); suspend FR-SVC-* priorities pending approach selection; add Section 1.4.3 (Service Element Lineage — 9 options evaluated, determination pending); add binary unlock trigger definition for FR-CORE-002 |
 
 ---
 
