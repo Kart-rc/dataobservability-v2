@@ -1,0 +1,593 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Signal Factory Deep Dive</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,600;12..96,700&family=Source+Serif+4:opsz,ital,wght@8..60,0,400;8..60,0,600;8..60,1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --paper: #F6F7F4;
+    --card: #FDFDFB;
+    --ink: #1B2530;
+    --muted: #5B6873;
+    --accent: #0E7C6B;
+    --accent-soft: #E3EFEA;
+    --amber: #B97417;
+    --amber-soft: #F5EAD8;
+    --line: #D9DED7;
+    --rail: #C7CEC6;
+    --danger: #A3442E;
+    --danger-soft: #F3E4DF;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #12181E;
+      --card: #1A222A;
+      --ink: #E5EAEA;
+      --muted: #93A0A8;
+      --accent: #34B39B;
+      --accent-soft: #1B2E2B;
+      --amber: #E0A04A;
+      --amber-soft: #33291A;
+      --line: #2A343C;
+      --rail: #38434C;
+      --danger: #D4765F;
+      --danger-soft: #33211C;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #12181E;
+    --card: #1A222A;
+    --ink: #E5EAEA;
+    --muted: #93A0A8;
+    --accent: #34B39B;
+    --accent-soft: #1B2E2B;
+    --amber: #E0A04A;
+    --amber-soft: #33291A;
+    --line: #2A343C;
+    --rail: #38434C;
+    --danger: #D4765F;
+    --danger-soft: #33211C;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: "Source Serif 4", Georgia, "Times New Roman", serif;
+    font-size: 17px;
+    line-height: 1.6;
+    margin: 0;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 56px 28px 72px; }
+  .eyebrow {
+    font-family: "IBM Plex Mono", "Courier New", monospace;
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 14px;
+  }
+  h1 {
+    font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif;
+    font-weight: 700;
+    font-size: clamp(34px, 5.5vw, 52px);
+    line-height: 1.05;
+    letter-spacing: -0.015em;
+    margin: 0 0 18px;
+    text-wrap: balance;
+  }
+  h2 {
+    font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif;
+    font-weight: 600;
+    font-size: 26px;
+    letter-spacing: -0.01em;
+    margin: 0 0 6px;
+    text-wrap: balance;
+  }
+  h3 {
+    font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif;
+    font-weight: 600;
+    font-size: 17px;
+    margin: 0 0 6px;
+  }
+  p { margin: 0 0 14px; }
+  .thesis { font-size: 20px; line-height: 1.5; max-width: 42em; margin: 0 0 8px; }
+  .thesis strong { color: var(--accent); font-weight: 600; }
+  .lede { color: var(--muted); max-width: 47em; margin-bottom: 26px; }
+  section { margin-top: 64px; }
+  .mono { font-family: "IBM Plex Mono", "Courier New", monospace; font-variant-numeric: tabular-nums; }
+  .note { font-size: 13.5px; color: var(--muted); margin-top: 12px; }
+
+  /* incident tape */
+  .tape { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-top: 22px; }
+  .tape-col { border-radius: 8px; border: 1px solid var(--line); background: var(--card); overflow: hidden; }
+  .tape-head {
+    padding: 14px 20px 12px;
+    font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif;
+    font-weight: 700; font-size: 17px;
+    display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+  }
+  .tape-col.bad .tape-head { background: var(--danger-soft); color: var(--danger); }
+  .tape-col.good .tape-head { background: var(--accent-soft); color: var(--accent); }
+  .tape-head .clock { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 13px; font-weight: 600; }
+  .tape-body { padding: 16px 20px 18px; }
+  .step { display: grid; grid-template-columns: 58px 1fr; gap: 12px; padding: 7px 0; font-size: 15px; line-height: 1.5; }
+  .step .t { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 12px; color: var(--muted); padding-top: 3px; white-space: nowrap; }
+  .step + .step { border-top: 1px dashed var(--line); }
+  .tape-foot { padding: 12px 20px 16px; font-size: 14.5px; color: var(--muted); border-top: 1px solid var(--line); }
+  .tape-foot strong { color: var(--ink); }
+
+  /* layers */
+  .layers { margin-top: 22px; display: grid; }
+  .layer {
+    display: grid; grid-template-columns: 130px 1fr; gap: 20px;
+    background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+    padding: 18px 22px; position: relative;
+  }
+  .layer + .layer { margin-top: 26px; }
+  .layer + .layer::before { content: ""; position: absolute; top: -27px; left: 62px; width: 2px; height: 26px; background: var(--rail); }
+  .layer + .layer::after { content: ""; position: absolute; top: -8px; left: 58px; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 7px solid var(--rail); }
+  .layer .lname { font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif; font-weight: 700; font-size: 19px; color: var(--accent); }
+  .layer .lstep { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 11px; letter-spacing: 0.12em; color: var(--muted); display: block; margin-bottom: 2px; }
+  .layer .ldesc { font-size: 15.5px; line-height: 1.55; }
+  .layer .ldesc p { margin: 0; }
+  .layer .ldesc .who { color: var(--muted); font-size: 14px; margin-top: 6px; }
+  .layer.join { border-color: var(--accent); border-width: 1.5px; }
+  .layer.join .badge {
+    display: inline-block; background: var(--accent-soft); color: var(--accent);
+    font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 10.5px;
+    letter-spacing: 0.1em; text-transform: uppercase; border-radius: 999px;
+    padding: 3px 10px; margin-top: 8px;
+  }
+
+  /* chips + snapshot */
+  .pos-label {
+    font-family: "IBM Plex Mono", "Courier New", monospace;
+    font-size: 11.5px; letter-spacing: 0.13em; text-transform: uppercase;
+    color: var(--muted); margin: 0 0 12px;
+  }
+  .chips { display: flex; flex-wrap: wrap; gap: 10px; }
+  .chip {
+    background: var(--card); border: 1px solid var(--line); border-radius: 999px;
+    padding: 7px 16px; font-size: 14px;
+    font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif; font-weight: 600;
+    display: inline-flex; align-items: center; gap: 8px;
+  }
+  .chip .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .chip.exists .dot { background: var(--accent); }
+  .chip.building .dot { background: var(--amber); }
+  .chip .st { font-family: "IBM Plex Mono", "Courier New", monospace; font-weight: 500; font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+  .snap { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; margin-top: 20px; }
+  .snap .s {
+    background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+    padding: 14px 16px 12px;
+  }
+  .snap .v { font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif; font-weight: 700; font-size: 24px; line-height: 1.15; }
+  .snap .v.tbd { color: var(--muted); }
+  .snap .k { font-size: 13.5px; color: var(--muted); margin-top: 4px; line-height: 1.4; }
+
+  /* chart */
+  .chart-card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 22px 22px 12px; margin-top: 22px; overflow-x: auto; }
+  .chart-card svg { display: block; min-width: 680px; width: 100%; height: auto; }
+  .chart-note { font-size: 14.5px; color: var(--muted); max-width: 48em; margin-top: 14px; }
+
+  /* tables (shared) */
+  .tbl-scroll { overflow-x: auto; margin-top: 22px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); }
+  table.tbl { border-collapse: collapse; width: 100%; min-width: 700px; font-size: 14.5px; }
+  table.tbl th {
+    font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 11px;
+    letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted);
+    text-align: left; font-weight: 600; padding: 14px 16px 10px;
+    border-bottom: 1px solid var(--line); white-space: nowrap;
+  }
+  table.tbl td { padding: 12px 16px; border-bottom: 1px solid var(--line); vertical-align: top; line-height: 1.5; }
+  table.tbl tr:last-child td { border-bottom: none; }
+  table.tbl .cap { font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif; font-weight: 600; font-size: 15px; }
+  table.tbl .ph { font-family: "IBM Plex Mono", "Courier New", monospace; font-weight: 600; font-size: 12.5px; color: var(--accent); white-space: nowrap; }
+  table.tbl .trig { color: var(--muted); }
+  table.tbl .num { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 13px; white-space: nowrap; }
+  table.tbl .mid { font-family: "IBM Plex Mono", "Courier New", monospace; font-weight: 600; font-size: 12.5px; color: var(--amber); white-space: nowrap; }
+
+  /* maturity pills */
+  .lvl {
+    display: inline-block; font-family: "IBM Plex Mono", "Courier New", monospace;
+    font-size: 11.5px; font-weight: 600; border-radius: 4px; padding: 2px 8px; white-space: nowrap;
+  }
+  .lvl.l0 { background: var(--danger-soft); color: var(--danger); }
+  .lvl.l1 { background: var(--amber-soft); color: var(--amber); }
+  .lvl.l2 { background: var(--accent-soft); color: var(--accent); }
+  .lvl.l3 { background: var(--accent); color: var(--paper); }
+  .lvl.l4 { background: var(--ink); color: var(--paper); }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px 18px; margin-top: 14px; font-size: 13.5px; color: var(--muted); align-items: center; }
+
+  /* phases */
+  .phase { border-top: 1px solid var(--line); padding: 32px 0 36px; }
+  .p-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px 16px; margin-bottom: 6px; }
+  .p-tag { font-family: "IBM Plex Mono", "Courier New", monospace; font-weight: 600; font-size: 13px; color: var(--accent); background: var(--accent-soft); border-radius: 4px; padding: 3px 9px; }
+  .p-months { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 12px; color: var(--muted); }
+  .p-outcome { font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif; font-weight: 700; font-size: 23px; letter-spacing: -0.01em; margin: 4px 0 10px; text-wrap: balance; }
+  .p-outcome .q { color: var(--accent); }
+  .p-sum { max-width: 48em; margin-bottom: 16px; }
+  .p-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(215px, 1fr)); gap: 14px; }
+  .cell { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; font-size: 15px; line-height: 1.55; }
+  .cell .lbl { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 11px; letter-spacing: 0.13em; text-transform: uppercase; color: var(--muted); display: block; margin-bottom: 8px; }
+  .cell.proof { border-left: 3px solid var(--amber); }
+  .cell.proof .lbl { color: var(--amber); }
+  .cell.trap { border-left: 3px solid var(--danger); }
+  .cell.trap .lbl { color: var(--danger); }
+  .cell ul { margin: 0; padding-left: 18px; }
+  .cell li { margin-bottom: 6px; }
+  .cell li:last-child { margin-bottom: 0; }
+  .metric { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 13.5px; }
+  .mid { font-family: "IBM Plex Mono", "Courier New", monospace; font-weight: 600; font-size: 13px; color: var(--accent); }
+
+  /* at-a-glance + toc */
+  .glance { display: grid; grid-template-columns: repeat(auto-fit, minmax(172px, 1fr)); gap: 12px; margin-top: 34px; }
+  .gl { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  .gl .gt { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--amber); display: block; margin-bottom: 6px; }
+  .gl p { margin: 0; font-size: 13.8px; line-height: 1.5; }
+  .gl p b { font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif; }
+  .toc { margin-top: 18px; padding: 12px 18px; background: var(--card); border: 1px solid var(--line); border-radius: 8px; font-size: 13px; line-height: 2.1; }
+  .toc .toc-t { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin-right: 12px; }
+  .toc a { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 12px; color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--line); margin-right: 14px; white-space: nowrap; }
+  .toc a:hover { border-bottom-color: var(--accent); }
+
+  /* workstream swimlane */
+  table.tbl.swim { min-width: 940px; }
+  table.tbl.swim td { font-size: 12.8px; padding: 11px 12px; line-height: 1.5; }
+  table.tbl.swim td.ws { font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif; font-weight: 600; font-size: 13.5px; white-space: normal; min-width: 130px; }
+  table.tbl.swim td.ws small { display: block; font-family: "IBM Plex Mono", "Courier New", monospace; font-weight: 400; font-size: 10px; color: var(--muted); margin-top: 3px; }
+  .st { display: inline-block; font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 10.5px; font-weight: 600; border-radius: 4px; padding: 2px 8px; white-space: nowrap; }
+  .st.n { color: var(--muted); background: none; border: 1px dashed var(--line); font-weight: 400; }
+  .st.d { color: var(--muted); border: 1px solid var(--line); background: var(--paper); }
+  .st.b { background: var(--amber-soft); color: var(--amber); }
+  .st.l { background: var(--accent-soft); color: var(--accent); }
+  .st-note { display: block; font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 9.5px; color: var(--muted); margin-top: 3px; font-weight: 400; }
+  .fcard .u-why b { color: var(--ink); font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif; font-size: 13.5px; }
+  .fcard .nots { color: var(--muted); font-size: 13.5px; margin-top: 6px; border-top: 1px dashed var(--line); padding-top: 6px; }
+  .fcard .nots b { color: var(--danger); font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif; font-size: 13px; }
+
+  /* capability unlock ladder */
+  .unlock { margin-top: 22px; display: grid; gap: 12px; }
+  .u-item {
+    display: grid; grid-template-columns: 92px 1fr; gap: 18px;
+    background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+    padding: 15px 18px; align-items: start;
+  }
+  .u-phase { font-family: "IBM Plex Mono", "Courier New", monospace; font-weight: 600; font-size: 12.5px; color: var(--accent); padding-top: 2px; }
+  .u-phase small { display: block; font-weight: 400; font-size: 10.5px; color: var(--muted); margin-top: 2px; }
+  .u-title { font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif; font-weight: 700; font-size: 16.5px; }
+  .u-title .tech { font-family: "IBM Plex Mono", "Courier New", monospace; font-weight: 400; font-size: 11px; color: var(--muted); margin-left: 8px; }
+  .u-key { font-size: 14.5px; margin-top: 4px; }
+  .u-key b { color: var(--accent); font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif; font-size: 14px; }
+  .u-why { font-size: 14px; color: var(--muted); margin-top: 3px; line-height: 1.5; }
+  @media (max-width: 560px) { .u-item { grid-template-columns: 1fr; gap: 6px; } }
+
+  /* dependency ask cards */
+  .dep-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(285px, 1fr)); gap: 14px; margin-top: 22px; }
+  .dep { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; display: flex; flex-direction: column; gap: 8px; }
+  .dep.critical { border-color: var(--danger); border-width: 1.5px; }
+  .dep-top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+  .dep-who { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+  .eff { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 10px; font-weight: 600; border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
+  .eff.ro { background: var(--accent-soft); color: var(--accent); }
+  .eff.cfg { background: var(--amber-soft); color: var(--amber); }
+  .eff.dec { background: var(--danger-soft); color: var(--danger); }
+  .dep-ask { font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif; font-weight: 700; font-size: 16.5px; line-height: 1.3; }
+  .dep-meta { font-size: 13.5px; line-height: 1.55; color: var(--muted); }
+  .dep-meta b { color: var(--ink); font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif; font-size: 13px; }
+  .dep-meta .row { display: block; padding: 4px 0; border-top: 1px dashed var(--line); }
+  .dep-meta .row:first-child { border-top: none; }
+
+  /* milestone screen mockups */
+  .shot { margin-top: 34px; }
+  .shot-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px 14px; margin-bottom: 4px; }
+  .shot-tag { font-family: "IBM Plex Mono", "Courier New", monospace; font-weight: 600; font-size: 12.5px; color: var(--amber); background: var(--amber-soft); border-radius: 4px; padding: 3px 9px; white-space: nowrap; }
+  .shot-title { font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif; font-weight: 700; font-size: 18px; }
+  .shot-new { font-size: 14.5px; color: var(--muted); max-width: 50em; margin: 2px 0 12px; }
+  .shot-new strong { color: var(--ink); }
+  .mock { background: var(--card); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .mock-bar { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--paper); }
+  .mock-bar .dots { display: flex; gap: 4px; }
+  .mock-bar .dots i { width: 8px; height: 8px; border-radius: 50%; background: var(--rail); display: inline-block; }
+  .mock-bar .mt { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 11px; color: var(--muted); letter-spacing: 0.04em; }
+  .mock-body { padding: 14px 16px 16px; font-size: 13px; }
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: stretch; }
+  .gapnote {
+    grid-column: 1 / -1; text-align: center;
+    font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 11.5px; color: var(--danger);
+    border: 1px dashed var(--danger); border-radius: 6px; padding: 7px 10px; background: var(--danger-soft);
+  }
+  .mrow { display: grid; grid-template-columns: 1.35fr 1.25fr 0.75fr 0.62fr 0.62fr; gap: 8px; padding: 6px 8px; border-bottom: 1px dashed var(--line); font-size: 12.5px; align-items: center; }
+  .mrow:last-child { border-bottom: none; }
+  .mrow.mhead { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--line); }
+  .mrow .ds { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 11.5px; }
+  .bsrc { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 9.5px; border: 1px solid var(--line); border-radius: 4px; padding: 1px 6px; color: var(--muted); white-space: nowrap; }
+  .bsrc.auto { border-color: var(--accent); color: var(--accent); }
+  .pill { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 10px; font-weight: 600; border-radius: 999px; padding: 2px 8px; white-space: nowrap; display: inline-block; }
+  .pill.ok { background: var(--accent-soft); color: var(--accent); }
+  .pill.warn { background: var(--amber-soft); color: var(--amber); }
+  .pill.fail { background: var(--danger-soft); color: var(--danger); }
+  .pill.hold { background: var(--amber-soft); color: var(--amber); }
+  .tstamp { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 10.5px; color: var(--muted); white-space: nowrap; }
+  .alertbar { border: 1px solid var(--danger); background: var(--danger-soft); border-radius: 6px; padding: 10px 12px; font-size: 12.5px; line-height: 1.5; margin-bottom: 12px; }
+  .alertbar .ah { font-family: "IBM Plex Mono", "Courier New", monospace; font-weight: 600; font-size: 11px; color: var(--danger); letter-spacing: 0.08em; display: block; margin-bottom: 3px; }
+  .alertbar .act { display: inline-block; margin-top: 6px; font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 10.5px; border: 1px solid var(--danger); border-radius: 4px; padding: 2px 8px; color: var(--danger); }
+  .lstrip { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 10px 0; }
+  .lnode { border: 1px solid var(--line); background: var(--paper); border-radius: 4px; padding: 4px 9px; font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 10.5px; white-space: nowrap; }
+  .lnode small { display: block; font-size: 9px; color: var(--muted); letter-spacing: 0.05em; }
+  .lnode.cause { border-color: var(--amber); }
+  .lnode.cause small { color: var(--amber); }
+  .lnode.bad { border-color: var(--danger); background: var(--danger-soft); }
+  .lnode.bad small { color: var(--danger); }
+  .lnode.risk { border-color: var(--amber); background: var(--amber-soft); }
+  .lnode.risk small { color: var(--amber); }
+  .larr { color: var(--rail); font-size: 13px; }
+  .kv { display: flex; flex-wrap: wrap; gap: 8px 22px; font-size: 12.5px; margin-top: 8px; }
+  .kv b { font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif; font-size: 12.5px; }
+  .kv span { color: var(--muted); }
+  .certbar { border: 1px solid var(--amber); background: var(--amber-soft); border-radius: 6px; padding: 9px 12px; font-size: 12.5px; margin-bottom: 12px; }
+  .certbar .ch { font-family: "IBM Plex Mono", "Courier New", monospace; font-weight: 600; font-size: 11px; color: var(--amber); letter-spacing: 0.08em; }
+  .crule { display: grid; grid-template-columns: 1fr auto; gap: 10px; padding: 6px 8px; border-bottom: 1px dashed var(--line); font-size: 12px; align-items: center; }
+  .crule:last-child { border-bottom: none; }
+  .crule code { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 11px; }
+  .gtiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+  .gt { border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; }
+  .gt .gv { font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif; font-weight: 700; font-size: 21px; line-height: 1.1; }
+  .gt .gk { font-size: 11.5px; color: var(--muted); margin-top: 3px; line-height: 1.35; }
+  .gt .gd { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 10px; color: var(--accent); margin-top: 3px; }
+  .minichart { margin-top: 4px; }
+
+  /* dashboard views */
+  .views { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; margin-top: 20px; }
+  .view { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 16px 18px; font-size: 15px; line-height: 1.55; }
+  .view .aud { font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--amber); display: block; margin-bottom: 6px; }
+  .view p { margin: 0; color: var(--muted); }
+
+  /* ROI */
+  .roi { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 22px; }
+  .roi-col { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 18px 22px; }
+  .roi-col h3 { font-size: 16px; }
+  .roi-col.ask { border-color: var(--accent); border-width: 1.5px; }
+  .roi-line { display: flex; justify-content: space-between; gap: 14px; padding: 8px 0; border-bottom: 1px dashed var(--line); font-size: 14.5px; }
+  .roi-line:last-of-type { border-bottom: none; }
+  .roi-line .amt { font-family: "IBM Plex Mono", "Courier New", monospace; font-weight: 600; font-size: 13.5px; white-space: nowrap; }
+  .roi-col .fine { font-size: 13.5px; color: var(--muted); margin: 10px 0 0; }
+
+  /* rules / governance / alignment */
+  .rules { margin-top: 20px; display: grid; gap: 14px; }
+  .rule { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 16px 20px; display: grid; grid-template-columns: 44px 1fr; gap: 16px; align-items: start; }
+  .rule .n { font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif; font-weight: 700; font-size: 26px; color: var(--accent); line-height: 1.2; }
+  .rule p { margin: 0; font-size: 15.5px; }
+  .rule p strong { font-family: "Bricolage Grotesque", "Arial Narrow", sans-serif; font-size: 15.5px; }
+  .gov-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; margin-top: 20px; }
+  .gov { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 16px 18px; font-size: 15px; line-height: 1.55; }
+  .gov p { margin: 0; color: var(--muted); }
+  .kill { background: var(--amber-soft); border: 1px solid var(--amber); border-radius: 6px; padding: 20px 22px; margin-top: 22px; }
+  .kill h3 { color: var(--amber); }
+  .kill p { margin: 0; font-size: 15.5px; max-width: 52em; }
+  .align-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; margin-top: 20px; background: var(--card); }
+  .align-cell { padding: 16px 18px; border-left: 1px solid var(--line); font-size: 14.5px; line-height: 1.5; }
+  .align-cell:first-child { border-left: none; }
+  .align-cell .m { font-family: "IBM Plex Mono", "Courier New", monospace; font-weight: 600; font-size: 12.5px; color: var(--accent); letter-spacing: 0.08em; display: block; margin-bottom: 6px; }
+  .align-cell .d { color: var(--muted); }
+
+  footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--line); font-size: 13.5px; color: var(--muted); }
+  @media (max-width: 620px) {
+    .layer { grid-template-columns: 1fr; gap: 6px; }
+    .layer + .layer::before, .layer + .layer::after { display: none; }
+  }
+</style>
+</head><body>
+<div class="wrap">
+  <header>
+    <p class="eyebrow">Data Observability Platform · Tech Leadership Deep Dive</p>
+    <h1>Signal Factory — Execution Deep Dive</h1>
+    <p class="thesis">One platform that answers four questions no single tool can: <strong>what broke, why, who is affected, and how it stops recurring.</strong> Built as four horizontal foundations by <strong>three mission teams of ten</strong> — each team owns exactly one mission, every mission converges on one pilot use case, and every milestone is a demo on that use case. This is one program with one definition of done, not three projects sharing a name.</p>
+  </header>
+
+  <div class="glance">
+    <div class="gl"><span class="gt">The problem</span><p>Data incidents cost ~<b>$2M/yr per 50 affected engineers</b>; cross-team failures take <b>4+ hr war rooms</b>; silent failures go unfound entirely.</p></div>
+    <div class="gl"><span class="gt">The vision</span><p>Every quality, lineage, and pipeline signal joined in <b>one evidence stream</b>, experienced through one product: lineage with health, cause, blast radius, trust.</p></div>
+    <div class="gl"><span class="gt">The plan</span><p><b>Four foundations, one pilot thread, six months</b> to use case 1 live end-to-end — then use cases onboard on a paved road.</p></div>
+    <div class="gl"><span class="gt">The org</span><p><b>3 mission teams × 10</b> — Onboarding &amp; Experience, Data Quality (sync + async), Lineage &amp; Confidence. One foundation each; zero context-switching.</p></div>
+    <div class="gl"><span class="gt">Your control</span><p><b>Kill criteria at month 6:</b> no real saves and no detection improvement → the program stops and the teams redeploy. Stated up front.</p></div>
+  </div>
+
+  <nav class="toc"><span class="toc-t">In this deep dive</span><a href="#problem">Problem</a><a href="#vision">Target state</a><a href="#strategy">Strategy</a><a href="#pillars">Pillars</a><a href="#roadmap">Roadmap &amp; milestones</a><a href="#execution">Teams &amp; capacity</a><a href="#deps">Critical path</a><a href="#govern">Governance</a><a href="#one">One platform</a></nav>
+
+  <section id="problem">
+    <h2>1 · The problem statement</h2>
+    <p class="lede">A payments service adds a new status value. Every team's own monitoring stays green — the failure lives in the <strong>seams between systems, and nobody owns the seams.</strong> Same incident, run both ways:</p>
+    <div class="tape">
+      <div class="tape-col bad">
+        <div class="tape-head">Today <span class="clock">≈ 2 days to truth</span></div>
+        <div class="tape-body">
+          <div class="step"><span class="t">Day 1</span><span>Upstream change silently maps new values to NULL. Batch job exits 0 — "success" — writing 8% fewer valid rows. No alert fires anywhere.</span></div>
+          <div class="step"><span class="t">Day 2</span><span>A finance analyst notices revenue looks low. Decisions have already been made on the wrong number.</span></div>
+          <div class="step"><span class="t">+4–6 hrs</span><span>War room: four teams paged, each tool truthfully reports its slice healthy. Root cause found by hand-diffing row counts.</span></div>
+        </div>
+        <div class="tape-foot"><strong>Cost:</strong> 4+ hrs × 5 engineers, a decision made on bad data, four teams paged for one team's change — ~<strong>$2M/yr</strong> in lost capacity per 50 affected engineers.</div>
+      </div>
+      <div class="tape-col good">
+        <div class="tape-head">Target state <span class="clock">≈ 30 minutes</span></div>
+        <div class="tape-body">
+          <div class="step"><span class="t">+2 min</span><span>Streaming monitor spots the new value and a NULL-rate spike at the topic — one hop from the cause.</span></div>
+          <div class="step"><span class="t">+20 min</span><span>One incident, not nine alerts: "Deploy a7b2c3 introduced an unmapped value; 6 downstream tables affected." One team paged, cause attached.</span></div>
+          <div class="step"><span class="t">+30 min</span><span>Certification gate holds the bad batch; consumers keep reading last-certified data. Finance told before the number is used.</span></div>
+        </div>
+        <div class="tape-foot"><strong>The difference:</strong> detection before consumption, one page instead of four, cause and blast radius named — bad data never reaches a decision.</div>
+      </div>
+    </div>
+    <p class="note">The gap is structural, not tooling: signals exist everywhere but are islands that cannot reference each other. No individual tool can close it — the seams need a platform that joins.</p>
+  </section>
+
+  <section id="vision">
+    <h2>2 · The target-state experience</h2>
+    <p class="lede">The end state is a single product where an engineer reads the estate the way the problem statement asks its questions. Each question maps to a lens of the target experience, each lens is powered by a foundation, and each has a named moment it first runs on real data:</p>
+    <div class="tbl-scroll">
+      <table class="tbl">
+        <thead><tr><th>The question</th><th>Experienced as (lens)</th><th>Powered by (foundation)</th><th>First real light-up</th></tr></thead>
+        <tbody>
+          <tr><td class="cap">What broke?</td><td>Lineage canvas with health on it · dataset health chips</td><td>Batch + post-write DQ and streaming DQ, federated in one evidence stream</td><td class="num">M1 one pane · M2–M3 detection</td></tr>
+          <tr><td class="cap">Why?</td><td>Causal chain on the incident card · provenance on every edge</td><td>E2E lineage collection joined to evidence + deploy events</td><td class="num">M4–M5 · confidence scores P3</td></tr>
+          <tr><td class="cap">Who is affected?</td><td>Impact — reactive blast radius</td><td>Lineage + consumer bindings from the onboarding manifest</td><td class="num">M4</td></tr>
+          <tr><td class="cap">How does it stop recurring?</td><td>Contracts + certification · impact simulation before a change ships</td><td>Contracts &amp; gate; scored graph + PR-time lineage diff</td><td class="num">M6–M7 · simulation P4</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">By month 18: bad data never reaches a Tier-1 consumer unseen; a new use case onboards in ≤ 2 weeks on a paved road; every lineage edge carries a confidence score; trust is visible where the graph is read.</p>
+  </section>
+
+  <section id="strategy">
+    <h2>3 · Strategy — horizontal foundations, proven vertically</h2>
+    <p class="lede">Foundations are built once and inherited by every use case; but they are <strong>proven on one pilot thread within six months</strong> — payments-svc → orders topic → enrichment job → gold.orders_enr → finance report. Checks shift left over time: learned at rest first (cheapest), extended to topic baselines, reaching service emission last.</p>
+    <div class="rules">
+      <div class="rule"><div class="n">1</div><p><strong>Every milestone is a demo on the pilot thread</strong> — "first catch," "blast radius on click," "use case 1 live" — never a percent-complete. A milestone you cannot demo is a status, not a milestone.</p></div>
+      <div class="rule"><div class="n">2</div><p><strong>Every team's definition of done includes landing in the shared evidence stream and naming registry.</strong> This one clause is what prevents three working islands — it binds all three missions to one platform before their first outputs land.</p></div>
+      <div class="rule"><div class="n">3</div><p><strong>Existing batch DQ is improved and federated, never replaced.</strong> The first evidence source at M1 — the fastest visible win, and it recruits the teams who built it.</p></div>
+    </div>
+    <p class="note">Alternatives considered and rejected: <strong>tool-per-team</strong> (more islands — the problem restated as a plan) · <strong>big-bang platform</strong> (18 months dark, no kill switch, demo risk concentrated at the end) · <strong>use-case one-offs</strong> (each costs ~6 weeks forever; nothing compounds). The foundation approach is the only one where cost per use case falls with each onboarding.</p>
+  </section>
+
+  <section id="pillars">
+    <h2>4 · Pillars &amp; maturity</h2>
+    <p class="lede">Levels: <span class="lvl l0">L0</span> doesn't exist · <span class="lvl l1">L1</span> islands, hand-built · <span class="lvl l2">L2</span> connected — one view, shared names · <span class="lvl l3">L3</span> runs itself · <span class="lvl l4">L4</span> prevents. No pillar jumps two levels in a phase; L4-everywhere is deliberately not the goal — maturity is matched to asset tier.</p>
+    <div class="tbl-scroll">
+      <table class="tbl">
+        <thead><tr><th>Pillar</th><th>Owner team</th><th>Today</th><th>Month 6 (M5 gate)</th><th>Month 12</th><th>Month 18</th></tr></thead>
+        <tbody>
+          <tr><td class="cap">Batch data quality</td><td>Data Quality</td><td><span class="lvl l1">L1 islands — being improved</span></td><td><span class="lvl l2">L2 connected (M1)</span></td><td><span class="lvl l3">L3 self-running</span></td><td><span class="lvl l4">L4 preventive</span></td></tr>
+          <tr><td class="cap">Post-write DQ (data at rest)</td><td>Data Quality</td><td><span class="lvl l1">L1 in build</span></td><td><span class="lvl l2">L2 connected (M2)</span></td><td><span class="lvl l3">L3 self-running</span></td><td><span class="lvl l4">L4 bound to gate</span></td></tr>
+          <tr><td class="cap">Streaming DQ (real-time, out-of-band)</td><td>Data Quality</td><td><span class="lvl l1">L1 pilot topic, in build</span></td><td><span class="lvl l2">L2 connected (M3)</span></td><td><span class="lvl l3">L3 wider topics</span></td><td><span class="lvl l3">L3 + in-path asserts (Tier-1)</span></td></tr>
+          <tr><td class="cap">E2E lineage collection</td><td>Lineage &amp; Confidence</td><td><span class="lvl l1">L1 capture in build</span></td><td><span class="lvl l2">L2 connected + provenance-tagged (M4)</span></td><td><span class="lvl l3">L3 self-refreshing + confidence-scored</span></td><td><span class="lvl l3">L3 + column-level, impact simulation</span></td></tr>
+          <tr><td class="cap">Data contracts</td><td>Data Quality</td><td><span class="lvl l0">L0 design only</span></td><td><span class="lvl l1">L1 format + registry ready</span></td><td><span class="lvl l3">L3 drafted &amp; enforced</span></td><td><span class="lvl l4">L4 gate + in-path (Tier-1)</span></td></tr>
+          <tr><td class="cap">Onboarding experience</td><td>Onboarding &amp; Experience</td><td><span class="lvl l1">L1 hand-run pilot</span></td><td><span class="lvl l1">L1 runbook v1 (M5)</span></td><td><span class="lvl l2">L2 templated (M8)</span></td><td><span class="lvl l3">L3 self-running per type</span></td></tr>
+          <tr><td class="cap">Data health dashboard</td><td>Onboarding &amp; Experience</td><td><span class="lvl l1">L1 in build</span></td><td><span class="lvl l2">L2 causal view</span></td><td><span class="lvl l3">L3 acts: route, gate, ledger</span></td><td><span class="lvl l3">L3 trend scorecards</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="roadmap">
+    <h2>5 · Roadmap &amp; milestones</h2>
+    <p class="lede">Three horizons. <strong>Now</strong> (M1–M5, months 1–6): foundations live and joined on use case 1 — the commitment. <strong>Next</strong> (M6–M8, months 7–9): prevention and the second use case — entered only through the month-6 gate. <strong>Horizon</strong> (P4, month 10+): simulation, in-path enforcement, automation — each switched on by a trigger, not a date. Every milestone names the accountable team.</p>
+    <div class="tbl-scroll">
+      <table class="tbl">
+        <thead><tr><th>M</th><th>When</th><th>What ships (a demo, not a status)</th><th>Lead → support</th><th>What it proves</th></tr></thead>
+        <tbody>
+          <tr><td class="mid">M1</td><td class="num">Month 1</td><td>Evidence stream + naming registry live; existing batch DQ federated; dashboard v0 shows the whole pilot thread in one pane, shared names, source badges.</td><td class="num">L&amp;C → DQ, O&amp;E</td><td>The join works; existing investment honored.</td></tr>
+          <tr><td class="mid">M2</td><td class="num">Month 2</td><td>Post-write DQ live: profiling baselines on at-rest datasets; auto-generated freshness + volume checks running out-of-band beside improved batch checks.</td><td class="num">DQ (async) → O&amp;E</td><td>The platform learns "normal" without producer effort.</td></tr>
+          <tr><td class="mid">M3</td><td class="num">Month 3</td><td>Streaming DQ live on the pilot topic — real-time, out-of-band, alert-only. First silent failure caught pre-consumption; saves-ledger entry with counterfactual cost.</td><td class="num">DQ (sync) → L&amp;C</td><td>Detection value is real; ingress detection built once for every future use case.</td></tr>
+          <tr><td class="mid">M4</td><td class="num">Month 4–5</td><td>Lineage joined to quality evidence + deploy events; blast-radius view live; every edge provenance-tagged (declared / config-emitted / runtime-observed).</td><td class="num">L&amp;C → O&amp;E</td><td>Incidents carry cause and impact, with trust visible per edge.</td></tr>
+          <tr><td class="mid">M5</td><td class="num">Month 6</td><td><strong>Use case 1 live end-to-end on all four foundations.</strong> Onboarding runbook v1. Live replay of a real past incident, root-caused &lt; 30 min. <strong>Go/no-go gate.</strong></td><td class="num">All three · O&amp;E orchestrates</td><td>The foundations join on a real case — and beat the war room.</td></tr>
+          <tr><td class="mid">M6</td><td class="num">Next · m7–8</td><td>First producer-accepted contract, auto-drafted from 90 days of observed behavior — a 20-minute review, not a workshop.</td><td class="num">DQ → domain teams</td><td>Prevention becomes possible.</td></tr>
+          <tr><td class="mid">M7</td><td class="num">Next · m8–9</td><td>Certification gate's first real block; consumers kept on last-known-good, zero exposure. Confidence scoring live on pilot edges.</td><td class="num">DQ → L&amp;C</td><td>Bad data can be stopped, not just found.</td></tr>
+          <tr><td class="mid">M8</td><td class="num">Next · m9</td><td>Use case 2 onboarded on the paved road — measurably faster (e.g., 6 weeks → 2) because it inherits the foundations.</td><td class="num">O&amp;E → all</td><td>This scales as a product, not a project.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Horizon triggers (P4): impact simulation + PR-time lineage diff ← a confidence-scored graph; in-path asserts ← an accepted contract plus a recurring violation class; onboarding automation ← the same use-case type onboarded manually twice; column-level lineage ← incidents that demanded a column-level answer. Nothing on this list waits for a date — each switches on when its dependency exists.</p>
+  </section>
+
+  <section id="execution">
+    <h2>6 · Execution plan — three missions, thirty engineers</h2>
+    <p class="lede">Each team owns <strong>one foundation end-to-end</strong> — mission, build, run, and its milestones. Nobody is split across projects; convergence is engineered, not hoped for: one pilot thread, one evidence stream in every definition of done, and a weekly joined demo on the thread from week 4.</p>
+
+    <div class="dep-grid">
+      <div class="dep">
+        <div class="dep-top"><span class="dep-who">Lineage &amp; Confidence</span><span class="eff ro">10 ENGINEERS · owns the platform core</span></div>
+        <div class="dep-ask">Mission: every signal joins under one identity, and every lineage edge is trustworthy — capture → join → score → simulate.</div>
+        <div class="dep-meta">
+          <span class="row"><b>Squads:</b> platform core — evidence stream + naming registry (3) · lineage collectors — skeleton, emitters, runtime (4) · join, provenance &amp; confidence (3).</span>
+          <span class="row"><b>P0–P1:</b> evidence stream + registry live (M1); capture edges end-to-end on the pilot.</span>
+          <span class="row"><b>P2:</b> the join — lineage × quality evidence × deploy events (M4, M5); provenance tags on every edge.</span>
+          <span class="row"><b>P3–P4:</b> confidence scoring (declared vs observed) GA; UC2 edges; impact simulation + PR-time lineage diff; column-level where incidents demand.</span>
+          <span class="row"><b>Definition of done:</b> an edge exists only when it is in the evidence stream, named in the registry, and provenance-tagged.</span>
+        </div>
+      </div>
+      <div class="dep">
+        <div class="dep-top"><span class="dep-who">Data Quality — sync + async</span><span class="eff ro">10 ENGINEERS · owns detection → prevention</span></div>
+        <div class="dep-ask">Mission: no silent failure reaches a consumer — checks at rest, detection in-stream, then contracts and the gate.</div>
+        <div class="dep-meta">
+          <span class="row"><b>Squads:</b> async / post-write — batch federation, profiling, auto-checks (4) · sync / streaming — monitor at the central chokepoint (4) · contracts &amp; gate — design now, enforce post-gate (2 → 4).</span>
+          <span class="row"><b>P0–P1:</b> batch improved + federated (M1); baselines + generated checks (M2); streaming monitor live on pilot topic (M3).</span>
+          <span class="row"><b>P2:</b> tuning; gate in shadow mode — logs what it would hold, holds nothing, earns trust.</span>
+          <span class="row"><b>P3–P4:</b> first accepted contract (M6); gate's first real block (M7); in-path asserts on Tier-1 streams only.</span>
+          <span class="row"><b>Definition of done:</b> a check exists only when its result lands in the evidence stream under registry names.</span>
+        </div>
+      </div>
+      <div class="dep">
+        <div class="dep-top"><span class="dep-who">Onboarding &amp; Experience</span><span class="eff ro">10 ENGINEERS · owns adoption &amp; the surface</span></div>
+        <div class="dep-ask">Mission: the platform is usable, provable, and cheap to join — the dashboard, the paved road, and the value evidence.</div>
+        <div class="dep-meta">
+          <span class="row"><b>Squads:</b> dashboard &amp; incident experience (5) · onboarding paved road — manifest, runbook, template, automation (3) · value governance — saves ledger, scorecard, gate pack (2).</span>
+          <span class="row"><b>P0–P1:</b> pilot manifest; dashboard v0 one-pane (M1); alerting views (M3); ledger + monthly scorecard live.</span>
+          <span class="row"><b>P2:</b> causal / blast-radius experience (M4); runbook v1; the M5 gate pack — replay demo, not a deck.</span>
+          <span class="row"><b>P3–P4:</b> UC2 on the template (M8); contracts &amp; certification UX; govern view; automation from UC3 — never before two manual samples.</span>
+          <span class="row"><b>Definition of done:</b> every view reads only the evidence stream — if it isn't joined, it cannot be rendered.</span>
+        </div>
+      </div>
+    </div>
+
+    <p class="lede" style="margin-top:34px">Capacity by phase — where each ten is, and what they are <em>not</em> doing:</p>
+    <div class="tbl-scroll">
+      <table class="tbl">
+        <thead><tr><th>Team</th><th>P0 · wks 1–4</th><th>P1 · m2–3</th><th>P2 · m4–6</th><th>P3 · m7–9</th><th>P4 · m10+</th></tr></thead>
+        <tbody>
+          <tr><td class="cap">Lineage &amp; Confidence</td><td>core 5 · collectors 5</td><td>core 3 · collectors 5 · join prep 2</td><td>join 6 · confidence v0 2 · run 2</td><td>confidence 4 · UC2 3 · run 3</td><td>simulation 5 · column-level 3 · run 2</td></tr>
+          <tr><td class="cap">Data Quality</td><td>federation 4 · profiling 3 · stream 3</td><td>auto-checks 4 · stream 4 · contract design 2</td><td>tuning 4 · shadow gate 3 · generator 3</td><td>contracts + gate 6 · run 4</td><td>in-path Tier-1 4 · estate widening 6</td></tr>
+          <tr><td class="cap">Onboarding &amp; Experience</td><td>dashboard 5 · manifest 3 · governance 2</td><td>dashboard 4 · runbook 2 · UX 2 · scorecard 2</td><td>causal view 5 · gate pack 3 · runbook 2</td><td>UC2 + template 5 · contracts UX 3 · govern 2</td><td>automation 5 · govern 3 · UX 2</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Read the columns: at no point does any team run more than three concurrent builds, and nothing outside a team's mission ever lands on it. Contracts stay at two designers until the gate passes; automation is staffed only after two manual onboardings exist. The convergence mechanisms — shared definition of done, weekly joined demo on the pilot thread, milestone = cross-team demo — are what make three teams one platform.</p>
+  </section>
+
+  <section id="deps">
+    <h2>7 · Critical path &amp; dependencies</h2>
+    <p class="lede">Two kinds of path risk: external asks (small, mostly read-only) and cross-team interlocks (engineered, dated). Dependency health is a monthly scorecard item with sponsor escalation — a slip is surfaced, never absorbed silently.</p>
+    <div class="tbl-scroll">
+      <table class="tbl">
+        <thead><tr><th>Dependency</th><th>Ask</th><th>Needed by</th><th>If it slips / Plan B</th></tr></thead>
+        <tbody>
+          <tr><td class="cap">Data platform / governance <span class="mid">THE critical ask</span></td><td>Agree one naming registry is the authority (pilot's ~10 assets first)</td><td class="num">P0</td><td>Every join fails silently later — the #1 program risk. Scoped small to be decidable fast.</td></tr>
+          <tr><td class="cap">Streaming platform</td><td>Read-only monitor credentials + topic catalog + schema registry read</td><td class="num">P0</td><td>Detection starts at tables; monitor runs in our account as an ordinary consumer.</td></tr>
+          <tr><td class="cap">Central DQ tooling</td><td>Read access to check results</td><td class="num">M1</td><td>Scheduled export — same data, slightly staler.</td></tr>
+          <tr><td class="cap">Platform engineering (CI/CD)</td><td>Deploy events with commit + timestamp, pilot pipelines only</td><td class="num">M4</td><td>Incidents name the system, not the deploy; infer from logs.</td></tr>
+          <tr><td class="cap">Interlock: L&amp;C → both teams</td><td>Evidence stream ingest contract stable</td><td class="num">Week 4</td><td>DQ and O&amp;E publish to a versioned stub; core team owns migration.</td></tr>
+          <tr><td class="cap">Interlock: O&amp;E → L&amp;C</td><td>Manifest schema (names, membership, consumers)</td><td class="num">Week 3</td><td>Registry seeds from streaming catalog alone; manifest catches up.</td></tr>
+          <tr><td class="cap">Interlock: DQ → O&amp;E</td><td>Check-result shape for dashboard v0</td><td class="num">Week 4</td><td>Dashboard renders raw evidence records until shaped.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="govern">
+    <h2>8 · Governance — how leadership keeps believing</h2>
+    <div class="gov-grid">
+      <div class="gov"><h3>Saves ledger</h3><p>Opens at M1. Every catch logged with its counterfactual: who would have consumed the bad data, what the last comparable incident cost.</p></div>
+      <div class="gov"><h3>Monthly scorecard</h3><p>Fixed cadence so silence is never read as stall: time-to-detect, time-to-root-cause, teams paged per incident, saves banked, foundations joined (0→4), dependency health.</p></div>
+      <div class="gov"><h3>Demo cadence</h3><p>Reviews are live replays on the pilot thread — the war room, then the causal chain. Milestones are demos; there is no "percent complete."</p></div>
+      <div class="gov"><h3>Sponsor-owned KPI</h3><p>The pilot thread is chosen so its health maps to one executive sponsor's own metric — one leader personally invested in the M5 replay.</p></div>
+    </div>
+    <div class="kill">
+      <h3>Kill criteria — stated up front</h3>
+      <p>If by the M5 checkpoint (month 6) the pilot thread has not logged real saves and cut time-to-detect below the agreed threshold — with all four foundations live and joined on use case 1 — the program stops and thirty engineers redeploy to their domains. Offering leadership the kill switch is what makes the vision credible rather than faith-based. Baselines are measured in Phase 0; the gate is decided on the scorecard, not on architecture progress.</p>
+    </div>
+  </section>
+
+  <section id="one">
+    <h2>9 · One platform, not three projects</h2>
+    <p class="lede">The test for "stretched thin" is simple: can each team state its one mission, and does every mission land in the same place? Here, yes — three missions, one evidence stream, one pilot thread, one product experience, one scorecard. The seams between the teams are exactly the seams the platform exists to close, and the convergence rules close them the same way: everything joins, or it doesn't count.</p>
+    <div class="align-strip">
+      <div class="align-cell"><span class="m">MONTH 6</span><span class="d">All four foundations live and joined on use case 1 — the first target-state experience on real data: lineage with health, cause on the incident card, reactive blast radius. Go/no-go gate.</span></div>
+      <div class="align-cell"><span class="m">MONTH 11</span><span class="d">Full platform live — enforcement and gating on, edges confidence-scored, multiple use cases onboarded on the paved road.</span></div>
+      <div class="align-cell"><span class="m">MONTH 18</span><span class="d">Critical use cases operating; impact simulation and PR-time lineage diff on Tier-1; column-level depth where incidents demanded it; expansion priced from measured cost per use case.</span></div>
+    </div>
+    <p class="note">Deliberately never on any team's list: "map everything" lineage crawls · estate-wide enforcement mandates · L4 everywhere · blocking on anomaly scores · automation before two manual samples. What a program refuses to do is half of its vision.</p>
+  </section>
+
+  <footer>
+    Pilot thread names, capacity splits, and scorecard targets are working figures — squad numbers are a starting allocation for the three 10-person teams, refined in Phase 0. Basis: Signal Factory value ladder (foundations, milestones, maturity) · Throughline target-state experience (lenses) · batch observability PRD · post-write validation HLD · federated lineage leadership case · Roadmap &amp; LOE (M6 / M11 / M18).
+  </footer>
+</div>
+</body></html>
